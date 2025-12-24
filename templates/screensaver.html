@@ -1,0 +1,287 @@
+SCREENSAVER_TEMPLATE = """\
+<!doctype html>
+<meta charset="utf-8"/>
+<title>Photos Screensaver</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+html,body{height:100%;width:100%;margin:0;background:#000;overflow:hidden;cursor:none}
+.stage{position:fixed;inset:0;display:grid;place-items:center}
+img,video{max-width:100vw;max-height:100vh;object-fit:contain;background:#000}
+.fade{animation:fade .6s ease}@keyframes fade{from{opacity:0}to{opacity:1}}
+.empty{color:#ccc;font-family:system-ui,sans-serif}
+#log{position:fixed;left:8px;bottom:8px;color:#888;font:12px ui-monospace,monospace;max-width:95vw;white-space:pre-wrap}
+
+/* Hidden YouTube music player (>=200x200 per IFrame API guidance) */
+#yt-sound {
+  position:fixed; left:-10000px; top:-10000px;
+  width:200px; height:200px; opacity:0; pointer-events:none;
+}
+
+/* Controls overlay */
+#yt-controls {
+  position:fixed; left:12px; bottom:12px;
+  display:flex; align-items:center; gap:8px;
+  background:rgba(0,0,0,0.55);
+  border:1px solid rgba(255,255,255,0.15);
+  border-radius:10px;
+  padding:8px 10px;
+  color:#eee; font:13px system-ui, sans-serif;
+  z-index: 10000;
+  transition: opacity .25s ease;
+}
+#yt-controls button {
+  border:none; outline:none;
+  padding:6px 8px; border-radius:6px;
+  background:#1a1a1a; color:#fff;
+  cursor:pointer;
+}
+#yt-controls button:hover { background:#333; }
+#yt-controls .spacer { width:1px; height:22px; background:#555; opacity:.4; }
+#yt-controls input[type="range"] {
+  width:120px;
+  accent-color:#08c;
+}
+#yt-controls .label { max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hide-cursor { cursor:none; }
+
+/* Auto-hide controls after inactivity */
+body.idle #yt-controls { opacity:0; pointer-events:none; }
+</style>
+
+<div class="stage"></div><div id="log"></div>
+<div id="yt-sound"></div>
+
+<div id="yt-controls">
+  <button id="yt-prev"     title="Previous (Shift+Left)">⏮</button>
+  <button id="yt-play"     title="Play/Pause (Space)">⏯</button>
+  <button id="yt-next"     title="Next (Shift+Right)">⏭</button>
+  <span class="spacer"></span>
+  <button id="yt-mute"     title="Mute/Unmute (M)">🔈</button>
+  <input  id="yt-volume"   type="range" min="0" max="100" step="1" title="Volume">
+  <span class="spacer"></span>
+  <span  id="yt-label"     class="label" title="Now playing">Now playing…</span>
+  <!-- NEW: fullscreen toggle -->
+  <span class="spacer"></span>
+  <button id="fs-toggle"   title="Fullscreen / Minimize">⛶</button>
+</div>
+
+<!-- YouTube IFrame API -->
+<script src="https://www.youtube.com/iframe_api"></script>
+
+<script>
+document.addEventListener('DOMContentLoaded', async () => {
+  // Best-effort: enter FS on load (Chromium --kiosk may already force fullscreen)
+  try {
+    const el=document.documentElement;
+    if(!document.fullscreenElement && el.requestFullscreen){
+      await el.requestFullscreen({navigationUI:'hide'});
+    }
+  } catch(e) {}
+
+  const ITEMS = {{ items|tojson }};
+  const INTERVAL = {{ interval_seconds }} * 1000;
+  const REFRESH_MS = {{ refresh_minutes }} * 60 * 1000;
+  const stage = document.querySelector('.stage');
+  const log = document.getElementById('log');
+  function logMsg(m){ log.textContent = m; }
+
+  if(!ITEMS || !ITEMS.length){
+    stage.innerHTML='<div class="empty">No items selected yet.<br/>Go back and pick photos.</div>';
+    logMsg('No ITEMS'); return;
+  }
+
+  function getWH(){
+    let w=Math.min(Math.max(1, Math.round(window.innerWidth||800)),800);
+    let h=Math.min(Math.max(1, Math.round(window.innerHeight||480)),480);
+    return {w,h};
+  }
+  function isVideo(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startsWith('video/') || mt.includes('motion'); }
+  function urlFor(it, kind){
+    const {w,h} = getWH();
+    const idx = ITEMS.indexOf(it);
+    const q = new URLSearchParams({kind, w:String(w), h:String(h)});
+    return '/content/'+idx+'?'+q.toString();
+  }
+
+  let idx = 0;
+  async function show(i){
+    const it = ITEMS[i]; if(!it) return;
+    stage.innerHTML = '';
+    let el, kind = isVideo(it) ? 'video' : 'image';
+    const url = urlFor(it, kind);
+
+    const onError = async () => {
+      const fallback = urlFor(it, 'image');
+      const img = document.createElement('img');
+      img.src = fallback; img.alt = it.filename||'';
+      img.addEventListener('error', ()=> logMsg('Fallback image error: '+fallback));
+      img.addEventListener('load', ()=> logMsg('Fallback image loaded: '+(it.filename||'')));
+      stage.innerHTML=''; stage.appendChild(img);
+    };
+
+    if(kind === 'video'){
+      el = document.createElement('video');
+      el.src = url; el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
+      el.addEventListener('error', async () => { logMsg('Video error: '+url); await onError(); });
+      el.addEventListener('loadeddata', () => logMsg('Playing video '+(it.filename||'')));
+    }else{
+      el = document.createElement('img');
+      el.src = url; el.alt = it.filename||'';
+      el.addEventListener('error', async () => { logMsg('Image error: '+url); await onError(); });
+      el.addEventListener('load', () => logMsg('Showing image '+(it.filename||'')));
+    }
+
+    el.className='fade'; stage.appendChild(el);
+  }
+
+  await show(idx);
+  setInterval(async () => { idx=(idx+1)%ITEMS.length; await show(idx); }, INTERVAL);
+  if(REFRESH_MS>0) setInterval(()=>{ logMsg('Refreshing to renew baseUrl…'); location.reload(); }, REFRESH_MS);
+});
+</script>
+
+<!-- YouTube music player with controls and robust Now Playing label -->
+<script>
+  const YT_VIDEO_ID    = {{ yt_video_id|tojson }};
+  const YT_PLAYLIST_ID = {{ yt_playlist_id|tojson }};
+  const YT_VOLUME      = {{ yt_volume|tojson }};
+  const YT_HIDE_VIDEO  = {{ yt_hide_video|tojson }};
+
+  const $play   = document.getElementById('yt-play');
+  const $prev   = document.getElementById('yt-prev');
+  const $next   = document.getElementById('yt-next');
+  const $mute   = document.getElementById('yt-mute');
+  const $vol    = document.getElementById('yt-volume');
+  const $label  = document.getElementById('yt-label');
+
+  let ytPlayer = null;
+  let labelPollT = null;
+  let labelPollTries = 0;
+
+  function setPlayingUI(playing) { $play.textContent = playing ? '⏸' : '⏯'; }
+  function setMuteUI(muted)      { $mute.textContent = muted ? '🔇' : '🔈'; }
+
+  function fallbackLabel() {
+    try {
+      const idx = ytPlayer.getPlaylistIndex();
+      const list = ytPlayer.getPlaylist() || [];
+      if (idx != null && idx >= 0 && idx < list.length) {
+        return `Track ${idx+1}`;
+      }
+      const url = ytPlayer.getVideoUrl();
+      const m = /[?&]v=([^&]+)/.exec(url);
+      return m ? `Video ${m[1]}` : 'Now playing…';
+    } catch { return 'Now playing…'; }
+  }
+  function updateLabel(forceFallback=false) {
+    let title = '';
+    try { const d = ytPlayer.getVideoData(); title = (d && d.title) ? d.title.trim() : ''; } catch {}
+    $label.textContent = (title && !forceFallback) ? title : fallbackLabel();
+  }
+  function startLabelPoll() {
+    clearInterval(labelPollT);
+    labelPollTries = 0;
+    labelPollT = setInterval(() => {
+      labelPollTries++;
+      updateLabel();
+      if (labelPollTries >= 10) clearInterval(labelPollT);
+    }, 2000);
+  }
+
+  function onYouTubeIframeAPIReady() {
+    const baseVars = { autoplay:1, controls:0, disablekb:1, modestbranding:1, rel:0, fs:0, playsinline:1, loop:1, origin:location.origin };
+    let playerVars = { ...baseVars };
+
+    if (YT_VIDEO_ID && !YT_PLAYLIST_ID) {
+      playerVars.playlist = YT_VIDEO_ID; // loop single video
+      ytPlayer = new YT.Player('yt-sound', {
+        width:200, height:200, videoId:YT_VIDEO_ID, playerVars,
+        events:{ onReady:onYtReady, onStateChange:onYtState, onError:onYtError }
+      });
+    } else if (YT_PLAYLIST_ID) {
+      ytPlayer = new YT.Player('yt-sound', {
+        width:200, height:200, playerVars:{ ...playerVars, listType:'playlist', list:YT_PLAYLIST_ID },
+        events:{ onReady:onYtReady, onStateChange:onYtState, onError:onYtError }
+      });
+    }
+  }
+
+  function onYtReady() {
+    try {
+      ytPlayer.setVolume(Math.max(0, Math.min(100, Number(YT_VOLUME) || 60)));
+      $vol.value = ytPlayer.getVolume();
+      setMuteUI(ytPlayer.isMuted());
+      updateLabel(true);
+      startLabelPoll();
+      ytPlayer.unMute();
+      ytPlayer.playVideo();
+      let tries = 0;
+      const attemptUnmute = () => { try { ytPlayer.unMute(); setMuteUI(false); } catch {} if (++tries < 5) setTimeout(attemptUnmute, 3000); };
+      setTimeout(() => {
+        const state = ytPlayer.getPlayerState();
+        if (state !== YT.PlayerState.PLAYING) {
+          ytPlayer.mute(); setMuteUI(true);
+          ytPlayer.playVideo();
+          setTimeout(attemptUnmute, 2000);
+        }
+      }, 800);
+    } catch(e) { console.warn('YouTube init error:', e); }
+  }
+  function onYtState(e) {
+    const st = e.data;
+    const playing = st === YT.PlayerState.PLAYING;
+    setPlayingUI(playing);
+    if (st === YT.PlayerState.PLAYING || st === YT.PlayerState.BUFFERING) {
+      updateLabel(); startLabelPoll();
+    }
+  }
+  function onYtError(e) { console.error('YouTube player error', e); }
+
+  $play.addEventListener('click', () => {
+    try { const st = ytPlayer.getPlayerState(); if (st === YT.PlayerState.PLAYING) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); } catch {}
+  });
+  $prev.addEventListener('click', () => { try { ytPlayer.previousVideo(); } catch {} });
+  $next.addEventListener('click', () => { try { ytPlayer.nextVideo(); } catch {} });
+  $mute.addEventListener('click', () => { try { if (ytPlayer.isMuted()) { ytPlayer.unMute(); setMuteUI(false); } else { ytPlayer.mute(); setMuteUI(true); } } catch {} });
+  $vol.addEventListener('input', () => { try { ytPlayer.setVolume(Number($vol.value)); } catch {} });
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.code === 'Space') { ev.preventDefault(); $play.click(); }
+    else if (ev.key.toLowerCase() === 'm') { $mute.click(); }
+    else if (ev.shiftKey && ev.code === 'ArrowLeft') { $prev.click(); }
+    else if (ev.shiftKey && ev.code === 'ArrowRight') { $next.click(); }
+  });
+
+  let idleT = null;
+  function bumpActivity() {
+    document.body.classList.remove('idle');
+    if (idleT) clearTimeout(idleT);
+    idleT = setTimeout(() => document.body.classList.add('idle'), 3000);
+  }
+  ['mousemove','mousedown','keydown','touchstart'].forEach(ev =>
+    document.addEventListener(ev, bumpActivity, {passive:true})
+  );
+  bumpActivity();
+</script>
+
+<!-- NEW: Fullscreen toggle logic -->
+<script>
+  function isFullscreen(){ return !!document.fullscreenElement; }
+  async function enterFullscreen(){ try{ await document.documentElement.requestFullscreen({navigationUI:'hide'}); }catch(e){ console.warn('requestFullscreen failed:', e); } }
+  async function exitFullscreen(){ try{ await document.exitFullscreen(); }catch(e){ console.warn('exitFullscreen failed:', e); } }
+  const fsBtn = document.getElementById('fs-toggle');
+  function updateFsUI(){
+    const on = isFullscreen();
+    if (fsBtn){
+      fsBtn.textContent = on ? '🗗' : '⛶';
+      fsBtn.title       = on ? 'Minimize (exit fullscreen)' : 'Fullscreen';
+    }
+  }
+  if (fsBtn){
+    fsBtn.addEventListener('click', async ()=>{ if(isFullscreen()) await exitFullscreen(); else await enterFullscreen(); updateFsUI(); });
+    document.addEventListener('fullscreenchange', updateFsUI);
+    updateFsUI();
+  }
+  document.addEventListener('keydown', (e)=>{ if (e.key.toLowerCase()==='f' && !e.ctrlKey && !e.altKey && !e.metaKey){ e.preventDefault(); fsBtn?.click(); } });
+</script>
+"""
