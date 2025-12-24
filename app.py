@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Google Photos Screensaver (Flask + Picker API) — 7" Raspberry Pi (800x480)
@@ -13,6 +14,7 @@ import time
 import json
 import logging
 from urllib.parse import urlencode
+from datetime import datetime
 
 import requests
 from flask import (
@@ -46,6 +48,9 @@ YT_HIDE_VIDEO = os.getenv("YT_HIDE_VIDEO", "true").lower() == "true"
 # --- Server-side token store (for kiosk localhost fetches) ---
 TOKENS_STORE = os.getenv("TOKENS_STORE", "tokens.json")
 DISABLE_SESSION_AUTH_FOR_LOCAL = os.getenv("DISABLE_SESSION_AUTH_FOR_LOCAL", "true").lower() == "true"
+
+# --- Auto-renew buffer for Picker sessions ---
+SESSION_RENEW_BUFFER_SEC = int(os.getenv("SESSION_RENEW_BUFFER_SEC", "60"))  # renew if expiring within next 60s
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -149,6 +154,43 @@ def get_server_access_token() -> str | None:
         if new_at:
             return new_at
     return at
+
+# -------------------------- session auto-renew helpers --------------------------
+def _iso_to_epoch(iso_ts: str) -> float:
+    """RFC3339 -> epoch seconds; accepts 'Z' and offsets."""
+    if not iso_ts:
+        return 0.0
+    return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).timestamp()
+
+def _is_expired_or_close(expire_iso: str, buffer_seconds: int = SESSION_RENEW_BUFFER_SEC) -> bool:
+    """True if session has expired or will expire within buffer."""
+    if not expire_iso:
+        return True
+    now = time.time()
+    exp = _iso_to_epoch(expire_iso)
+    return exp <= (now + buffer_seconds)
+
+def _ensure_session(access_token: str, picking_config: dict | None = None) -> dict:
+    """
+    Ensure we have a valid Picker session in Flask 'session'.
+    Renew if missing or expired/close-to-expiry.
+    Returns the API response dict (id/pickerUri/expireTime/...).
+    """
+    sid = session.get("picker_session_id")
+    exp = session.get("picker_expire_time")
+    if (not sid) or _is_expired_or_close(exp):
+        url = f"{PICKER_BASE}/sessions"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        payload = picking_config or {}
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        session["picker_session_id"] = data.get("id")
+        session["picker_uri"] = data.get("pickerUri")  # raw; /status appends /autoclose
+        session["picker_expire_time"] = data.get("expireTime")
+        app.logger.info("Created/renewed session id=%s exp=%s", session["picker_session_id"], session["picker_expire_time"])
+        return data
+    return {"id": sid, "pickerUri": session.get("picker_uri"), "expireTime": exp}
 
 
 @app.errorhandler(Exception)
@@ -323,7 +365,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   } catch(e) {}
 
   const ITEMS = {{ items|tojson }};
-  const INTERVAL = {{ interval_seconds }} * 10000;
+  const INTERVAL = {{ interval_seconds }} * 10000;  // DO NOT change; per request
   const REFRESH_MS = {{ refresh_minutes }} * 60 * 1000;
   const stage = document.querySelector('.stage');
   const log = document.getElementById('log');
@@ -360,21 +402,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       const fallback = urlFor(it, 'image');
       const img = document.createElement('img');
       img.src = fallback; img.alt = it.filename||'';
-      img.addEventListener('error', ()=> logMsg('Fallback image error: '+fallback));
-      img.addEventListener('load',  ()=> logMsg('Fallback image loaded: '+(it.filename||'')));
+      img.addEventListener('error', () => logMsg('Fallback image error: '+fallback));
+      img.addEventListener('load',  () => logMsg('Fallback image loaded: '+(it.filename||'')));
       stage.innerHTML=''; stage.appendChild(img);
     };
 
     if(kind === 'video'){
       el = document.createElement('video');
       el.src = url; el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
-      el.addEventListener('error', async ()=>{ logMsg('Video error: '+url); await onError(); });
-      el.addEventListener('loadeddata', ()=> logMsg('Playing video '+(it.filename||'')));
+      el.addEventListener('error', async () =>{ logMsg('Video error: '+url); await onError(); });
+      el.addEventListener('loadeddata', () => logMsg('Playing video '+(it.filename||'')));
     }else{
       el = document.createElement('img');
       el.src = url; el.alt = it.filename||'';
-      el.addEventListener('error', async ()=>{ logMsg('Image error: '+url); await onError(); });
-      el.addEventListener('load', ()=> logMsg('Showing image '+(it.filename||'')));
+      el.addEventListener('error', async () =>{ logMsg('Image error: '+url); await onError(); });
+      el.addEventListener('load', () => logMsg('Showing image '+(it.filename||'')));
     }
 
     el.className='fade'; stage.appendChild(el);
@@ -633,8 +675,16 @@ a.link{color:#7fc7ff}
 {% for it in items %}
   <div class="item">
     <div><strong>{{ loop.index }}.</strong> {{ it.filename or '(no filename)' }} — {{ it.mimeType }}</div>
-    <div>Proxied image URL: <a class="link" href="{{ url_for('content', index=loop.index0) }}?kind=image&w=800&h=480" target="_blank" rel="noopener">{{ url_for('content', index=loop.index0) }}?kind=image&w=800&h=480</a></div>
-    <div>Proxied video URL: <a class="link" href="{{ url_for('content', index=loop.index0) }}?kind=video" target="_blank" rel="noopener">{{ url_for('content', index=loop.index0) }}?kind=video</a></div>
+    <div>Proxied image URL:
+      <a class="link" href="{{ url_for('content', index=loop.index0) }}?kind=image&w=800&h=480" target="_blank" rel="noopener">
+        {{ url_for('content', index=loop.index0) }}?kind=image&w=800&h=480
+      </a>
+    </div>
+    <div>Proxied video URL:
+      <a class="link" href="{{ url_for('content', index=loop.index0) }}?kind=video" target="_blank" rel="noopener">
+        {{ url_for('content', index=loop.index0) }}?kind=video
+      </a>
+    </div>
     <div style="margin-top:.5rem">
       {% if it.mimeType and it.mimeType.lower().startswith('video') %}
         <video src="{{ url_for('content', index=loop.index0) }}?kind=video" controls muted playsinline></video>
@@ -727,16 +777,13 @@ def create_session():
         flash("Not authorized. Please start authorization.")
         return redirect(url_for("auth_start"))
 
-    url = f"{PICKER_BASE}/sessions"
-    headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        resp = requests.post(url, headers=headers, json={}, timeout=20)
-        if resp.status_code != 200:
-            app.logger.error("Create session failed: %s %s", resp.status_code, resp.text)
-            flash("Failed to create Picker session. Is the Photos Picker API enabled & scope correct?")
-            return redirect(url_for("pick"))
-        data = resp.json()
-        app.logger.info("sessions.create response: %s", data)
+        # Ensure a fresh session if none exists or near expiry
+        data = _ensure_session(access_token=access_token, picking_config={})
+    except requests.HTTPError as e:
+        app.logger.error("Create/renew session failed: %s", e)
+        flash("Failed to create Picker session. Is the Photos Picker API enabled & scope correct?")
+        return redirect(url_for("pick"))
     except Exception:
         app.logger.exception("Create session exception")
         flash("Network error creating Picker session.")
@@ -759,7 +806,16 @@ def api_picker_session():
 
 @app.route("/status")
 def status():
-    picker_uri = session.get("picker_uri")
+    access_token = session.get("access_token")
+    if access_token:
+        try:
+            data = _ensure_session(access_token=access_token)
+            picker_uri = (data.get("pickerUri") or session.get("picker_uri"))
+        except Exception:
+            app.logger.exception("Status: ensure_session failed")
+            picker_uri = session.get("picker_uri")
+    else:
+        picker_uri = session.get("picker_uri")
     if picker_uri:
         picker_uri = picker_uri.rstrip("/") + "/autoclose"
     return render_template_string(STATUS_TEMPLATE, picker_uri=picker_uri, session_id=session.get("picker_session_id"))
@@ -772,6 +828,12 @@ def api_poll():
     headers = {"Authorization": f"Bearer {access_token}"}
     status_url = f"{PICKER_BASE}/sessions/{session_id}"
     try:
+        # Renew immediately if expired now (no buffer during active polling)
+        if _is_expired_or_close(session.get("picker_expire_time"), buffer_seconds=0):
+            data = _ensure_session(access_token=access_token)
+            session_id = session.get("picker_session_id")
+            status_url = f"{PICKER_BASE}/sessions/{session_id}"
+
         r = requests.get(status_url, headers=headers, timeout=20)
         if r.status_code != 200:
             app.logger.error("Poll status failed: %s %s", r.status_code, r.text)
@@ -845,6 +907,20 @@ def fetch_selected():
     except Exception:
         app.logger.exception("Failed to save selected_media.json")
         flash("Failed to save selection locally (permission?)."); return redirect(url_for("screensaver"))
+
+    # --- Proactive cleanup: delete session (recommended to stay within limits) ---
+    try:
+        del_url = f"{PICKER_BASE}/sessions/{session_id}"
+        dr = requests.delete(del_url, headers=headers, timeout=20)  # sessions.delete
+        if dr.status_code not in (200, 204):
+            app.logger.warning("sessions.delete returned %s", dr.status_code)
+    except Exception:
+        app.logger.exception("Session delete failed")
+
+    # Clear session identifiers so next pick starts fresh
+    session.pop("picker_session_id", None)
+    session.pop("picker_uri", None)
+    session.pop("picker_expire_time", None)
 
     flash(f"Fetched {len(simplified)} selected items.")
     return redirect(url_for("screensaver"))
