@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pick Google Photos for Screensaver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,sans-serif;max-width:840px;margin:2rem auto;padding:0 1rem}
+    a.button{display:inline-block;padding:.6rem 1rem;border:1px solid #008cff;border-radius:6px;text-decoration:none;color:#fff;background:#008cff;margin-right:.5rem;margin-bottom:.5rem}
+    .flash{background:#fee;border:1px solid #f99;padding:.75rem;margin-bottom:1rem}
+    code{background:#eee;padding:.2rem .4rem;border-radius:4px}
+  </style>
+</head>
+<body>
+  <h1>Google Photos → Screensaver</h1>
+
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
+  {% endwith %}
+
+  <p>
+    <a class="button" href="{{ url_for('auth_start') }}">1) Authorize with Google</a>
+    <a class="button" href="{{ url_for('create_session') }}">2) Create Picker Session</a>
+    {% if picker_uri %}
+      <a class="button" href="{{ picker_uri }}" target="_blank" rel="noopener">3) Open Picker</a>
+      <a class="button" href="{{ url_for('poll_till_ready') }}">4) Poll for readiness</a>
+      <a class="button" href="{{ url_for('fetch_selected') }}">5) Fetch selected items</a>
+      <a class="button" href="{{ url_for('screensaver') }}">Launch screensaver</a>
+      <p>Session ID: <code>{{ session_id }}</code></p>
+    {% else %}
+      <a class="button" href="{{ url_for('screensaver') }}">Launch screensaver</a>
+    {% endif %}
+  </p>
+</body>
+</html>
