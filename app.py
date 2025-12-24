@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Google Photos Screensaver (Flask + Picker API) — 7" Raspberry Pi (800x480)
 - Status page opens Google Photos Picker (autoclose) and auto-polls the session.
@@ -79,7 +80,7 @@ def build_media_url(item: dict, kind: str, w: int = 800, h: int = 480) -> str:
     if not base:
         return ""
     if kind == "video" or mt.startswith("video/") or "motion" in mt:
-        return base + "=dv"  # video bytes via '=dv' (not compatible with w/h)
+        return base + "=dv"  # video stream via '=dv' (not compatible with w/h)
     return f"{base}=w{w}-h{h}"  # image bytes via width/height params
 
 # -------- token persistence & refresh (server-side) ----------
@@ -230,7 +231,14 @@ SCREENSAVER_TEMPLATE = """
 <style>
 html,body{height:100%;width:100%;margin:0;background:#000;overflow:hidden;cursor:none}
 .stage{position:fixed;inset:0;display:grid;place-items:center}
-img,video{max-width:100vw;max-height:100vh;object-fit:contain;background:#000}
+
+/* FILL SCREEN: photos/videos occupy the entire viewport */
+img,video{
+  width:100vw; height:100vh;
+  object-fit:scale-down;       /* crop to fill; no letterboxing */
+  background:#000;
+}
+
 .fade{animation:fade .6s ease}@keyframes fade{from{opacity:0}to{opacity:1}}
 .empty{color:#ccc;font-family:system-ui,sans-serif}
 #log{position:fixed;left:8px;bottom:8px;color:#888;font:12px ui-monospace,monospace;max-width:95vw;white-space:pre-wrap}
@@ -238,7 +246,7 @@ img,video{max-width:100vw;max-height:100vh;object-fit:contain;background:#000}
 /* Hidden YouTube music player (>=200x200 per IFrame API guidance) */
 #yt-sound {
   position:fixed; left:-10000px; top:-10000px;
-  width:200px; height:200px; opacity:0; pointer-events:none;
+  width:300px; height:300px; opacity:0; pointer-events:none;
 }
 
 /* Controls overlay */
@@ -252,12 +260,13 @@ img,video{max-width:100vw;max-height:100vh;object-fit:contain;background:#000}
   color:#eee; font:13px system-ui, sans-serif;
   z-index: 10000;
   transition: opacity .25s ease;
+  cursor: default; /* show cursor over controls */
 }
 #yt-controls button {
   border:none; outline:none;
   padding:6px 8px; border-radius:6px;
   background:#1a1a1a; color:#fff;
-  cursor:pointer;
+  cursor:pointer; display:flex; align-items:center; gap:6px;
 }
 #yt-controls button:hover { background:#333; }
 #yt-controls .spacer { width:1px; height:22px; background:#555; opacity:.4; }
@@ -284,6 +293,20 @@ body.idle #yt-controls { opacity:0; pointer-events:none; }
   <input  id="yt-volume"   type="range" min="0" max="100" step="1" title="Volume">
   <span class="spacer"></span>
   <span  id="yt-label"     class="label" title="Now playing">Now playing…</span>
+  <!-- Fullscreen toggle with SVG icons -->
+  <span class="spacer"></span>
+  <button id="fs-toggle"   title="Fullscreen / Minimize" aria-label="Toggle fullscreen">
+    <!-- ENTER FULLSCREEN ICON -->
+    <svg id="fs-icon-enter" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+        d="M3 10V3h7M21 14v7h-7M10 21H3v-7M21 3v7"/>
+    </svg>
+    <!-- EXIT FULLSCREEN ICON -->
+    <svg id="fs-icon-exit" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" style="display:none">
+      <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+        d="M7 7h4V3M17 17h-4v4M7 17h4v4M17 7h-4V3"/>
+    </svg>
+  </button>
 </div>
 
 <!-- YouTube IFrame API -->
@@ -291,22 +314,34 @@ body.idle #yt-controls { opacity:0; pointer-events:none; }
 
 <script>
 document.addEventListener('DOMContentLoaded', async () => {
-  try{ const el=document.documentElement; if(!document.fullscreenElement && el.requestFullscreen){ await el.requestFullscreen({navigationUI:'hide'});} }catch(e){}
+  // Best-effort: enter FS on load (Chromium --kiosk may already force fullscreen)
+  try {
+    const el=document.documentElement;
+    if(!document.fullscreenElement && el.requestFullscreen){
+      await el.requestFullscreen({navigationUI:'hide'});
+    }
+  } catch(e) {}
+
   const ITEMS = {{ items|tojson }};
-  const INTERVAL = {{ interval_seconds }} * 1000;
+  const INTERVAL = {{ interval_seconds }} * 10000;
   const REFRESH_MS = {{ refresh_minutes }} * 60 * 1000;
   const stage = document.querySelector('.stage');
   const log = document.getElementById('log');
   function logMsg(m){ log.textContent = m; }
 
-  if(!ITEMS || !ITEMS.length){ stage.innerHTML='<div class="empty">No items selected yet.<br/>Go back and pick photos.</div>'; logMsg('No ITEMS'); return; }
+  if(!ITEMS || !ITEMS.length){
+    stage.innerHTML='<div class="empty">No items selected yet.<br/>Go back and pick photos.</div>';
+    logMsg('No ITEMS'); return;
+  }
 
-  // Detect viewport; clamp to 800x480 (official 7" Pi)
-  function getWH(){ let w=Math.min(Math.max(1, Math.round(window.innerWidth||800)),800); let h=Math.min(Math.max(1, Math.round(window.innerHeight||480)),480); return {w,h}; }
+  // Use real viewport size (no hard clamp)
+  function getWH(){
+    const w = Math.max(1, Math.round(window.innerWidth || 800));
+    const h = Math.max(1, Math.round(window.innerHeight || 480));
+    return {w,h};
+  }
 
   function isVideo(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startsWith('video/') || mt.includes('motion'); }
-
-  // Build proxied URL
   function urlFor(it, kind){
     const {w,h} = getWH();
     const idx = ITEMS.indexOf(it);
@@ -322,12 +357,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const url = urlFor(it, kind);
 
     const onError = async () => {
-      // fallback to image rendition via proxy
       const fallback = urlFor(it, 'image');
       const img = document.createElement('img');
       img.src = fallback; img.alt = it.filename||'';
       img.addEventListener('error', ()=> logMsg('Fallback image error: '+fallback));
-      img.addEventListener('load', ()=> logMsg('Fallback image loaded: '+(it.filename||'')));
+      img.addEventListener('load',  ()=> logMsg('Fallback image loaded: '+(it.filename||'')));
       stage.innerHTML=''; stage.appendChild(img);
     };
 
@@ -352,14 +386,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 </script>
 
-<!-- YouTube music player with controls and robust Now Playing label -->
+<!-- YouTube music player with controls and auto-skip watchdog -->
 <script>
   const YT_VIDEO_ID    = {{ yt_video_id|tojson }};
   const YT_PLAYLIST_ID = {{ yt_playlist_id|tojson }};
   const YT_VOLUME      = {{ yt_volume|tojson }};
   const YT_HIDE_VIDEO  = {{ yt_hide_video|tojson }};
 
-  // Controls refs
   const $play   = document.getElementById('yt-play');
   const $prev   = document.getElementById('yt-prev');
   const $next   = document.getElementById('yt-next');
@@ -370,6 +403,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   let ytPlayer = null;
   let labelPollT = null;
   let labelPollTries = 0;
+
+  // --- Auto-skip watchdog: if not PLAYING within timeout, skip to next ---
+  let playWatchdogT = null;
+  const WATCHDOG_MS = 10000;  // wait up to 10s for PLAYING
+
+  function armPlayWatchdog() {
+    clearTimeout(playWatchdogT);
+    playWatchdogT = setTimeout(() => {
+      try {
+        const st = ytPlayer.getPlayerState();
+        if (st !== YT.PlayerState.PLAYING) {
+          console.warn('Watchdog: not playing after', WATCHDOG_MS, 'ms -> nextVideo()');
+          ytPlayer.nextVideo();
+        }
+      } catch(e) {
+        console.warn('Watchdog check failed:', e);
+      }
+    }, WATCHDOG_MS);
+  }
+  function disarmPlayWatchdog() {
+    clearTimeout(playWatchdogT);
+    playWatchdogT = null;
+  }
 
   function setPlayingUI(playing) { $play.textContent = playing ? '⏸' : '⏯'; }
   function setMuteUI(muted)      { $mute.textContent = muted ? '🔇' : '🔈'; }
@@ -389,10 +445,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function updateLabel(forceFallback=false) {
     let title = '';
-    try {
-      const d = ytPlayer.getVideoData();
-      title = (d && d.title) ? d.title.trim() : '';
-    } catch {}
+    try { const d = ytPlayer.getVideoData(); title = (d && d.title) ? d.title.trim() : ''; } catch {}
     $label.textContent = (title && !forceFallback) ? title : fallbackLabel();
   }
 
@@ -407,68 +460,50 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function onYouTubeIframeAPIReady() {
-    const baseVars = {
-      autoplay: 1,
-      controls: 0,
-      disablekb: 1,
-      modestbranding: 1,
-      rel: 0,
-      fs: 0,
-      playsinline: 1,
-      loop: 1,
-      origin: location.origin  // improves JS API/metadata consistency
-    };
-
+    const baseVars = { autoplay:1, controls:0, disablekb:1, modestbranding:1, rel:0, fs:0, playsinline:1, loop:1, origin:location.origin };
     let playerVars = { ...baseVars };
 
     if (YT_VIDEO_ID && !YT_PLAYLIST_ID) {
-      playerVars.playlist = YT_VIDEO_ID; // required for loop with single video
+      playerVars.playlist = YT_VIDEO_ID; // loop single video
       ytPlayer = new YT.Player('yt-sound', {
-        width: 200, height: 200,
-        videoId: YT_VIDEO_ID,
-        playerVars,
-        events: { 'onReady': onYtReady, 'onStateChange': onYtState, 'onError': onYtError }
+        width:200, height:200, videoId:YT_VIDEO_ID, playerVars,
+        events:{ onReady:onYtReady, onStateChange:onYtState, onError:onYtError }
       });
     } else if (YT_PLAYLIST_ID) {
       ytPlayer = new YT.Player('yt-sound', {
-        width: 200, height: 200,
-        playerVars: { ...playerVars, listType: 'playlist', list: YT_PLAYLIST_ID },
-        events: { 'onReady': onYtReady, 'onStateChange': onYtState, 'onError': onYtError }
+        width:200, height:200, playerVars:{ ...playerVars, listType:'playlist', list:YT_PLAYLIST_ID },
+        events:{ onReady:onYtReady, onStateChange:onYtState, onError:onYtError }
       });
     }
   }
+  window.onYouTubeIframeAPIReady = onYouTubeIframeAPIReady;
 
   function onYtReady() {
     try {
       ytPlayer.setVolume(Math.max(0, Math.min(100, Number(YT_VOLUME) || 60)));
       $vol.value = ytPlayer.getVolume();
       setMuteUI(ytPlayer.isMuted());
-
       updateLabel(true);
       startLabelPoll();
 
-      // Try unmuted, fallback to muted then retry unmute
       ytPlayer.unMute();
       ytPlayer.playVideo();
 
-      let tries = 0;
-      const attemptUnmute = () => {
-        try { ytPlayer.unMute(); setMuteUI(false); } catch {}
-        if (++tries < 5) setTimeout(attemptUnmute, 3000);
-      };
+      // Arm watchdog to ensure we reach PLAYING
+      armPlayWatchdog();
 
+      // Fallback: try muted then unmute (handles autoplay policies)
+      let tries = 0;
+      const attemptUnmute = () => { try { ytPlayer.unMute(); setMuteUI(false); } catch {} if (++tries < 5) setTimeout(attemptUnmute, 3000); };
       setTimeout(() => {
         const state = ytPlayer.getPlayerState();
         if (state !== YT.PlayerState.PLAYING) {
-          ytPlayer.mute();
-          setMuteUI(true);
+          ytPlayer.mute(); setMuteUI(true);
           ytPlayer.playVideo();
           setTimeout(attemptUnmute, 2000);
         }
       }, 800);
-    } catch(e) {
-      console.warn('YouTube init error:', e);
-    }
+    } catch(e) { console.warn('YouTube init error:', e); }
   }
 
   function onYtState(e) {
@@ -476,34 +511,44 @@ document.addEventListener('DOMContentLoaded', async () => {
     const playing = st === YT.PlayerState.PLAYING;
     setPlayingUI(playing);
 
-    // Update on PLAYING/BUFFERING; metadata often arrives during buffering
-    if (st === YT.PlayerState.PLAYING || st === YT.PlayerState.BUFFERING) {
-      updateLabel();
-      startLabelPoll();
+    if (st === YT.PlayerState.PLAYING) {
+      // Playing: cancel watchdog
+      disarmPlayWatchdog();
+      updateLabel(); startLabelPoll();
+    } else if (st === YT.PlayerState.BUFFERING || st === YT.PlayerState.UNSTARTED) {
+      // Buffering/unstarted: (re)arm watchdog
+      armPlayWatchdog();
+      updateLabel(); startLabelPoll();
+    } else if (st === YT.PlayerState.ENDED) {
+      // Let YT loop/advance; re-arm watchdog just in case
+      armPlayWatchdog();
+    } else if (st === YT.PlayerState.PAUSED || st === YT.PlayerState.CUED) {
+      if (st === YT.PlayerState.PAUSED) {
+        disarmPlayWatchdog();
+      } else {
+        armPlayWatchdog();
+      }
     }
   }
 
-  function onYtError(e) { console.error('YouTube player error', e); }
+  function onYtError(e) {
+    console.error('YouTube player error', e);
+    try {
+      ytPlayer.nextVideo();      // immediately skip problematic track
+      armPlayWatchdog();         // ensure the next one reaches PLAYING
+    } catch(err) {
+      console.warn('Failed to advance on error:', err);
+    }
+  }
 
-  // Button handlers
   $play.addEventListener('click', () => {
-    try {
-      const st = ytPlayer.getPlayerState();
-      if (st === YT.PlayerState.PLAYING) ytPlayer.pauseVideo();
-      else ytPlayer.playVideo();
-    } catch {}
+    try { const st = ytPlayer.getPlayerState(); if (st === YT.PlayerState.PLAYING) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); } catch {}
   });
-  $prev.addEventListener('click', () => { try { ytPlayer.previousVideo(); } catch {} });
-  $next.addEventListener('click', () => { try { ytPlayer.nextVideo(); } catch {} });
-  $mute.addEventListener('click', () => {
-    try {
-      if (ytPlayer.isMuted()) { ytPlayer.unMute(); setMuteUI(false); }
-      else { ytPlayer.mute(); setMuteUI(true); }
-    } catch {}
-  });
+  $prev.addEventListener('click', () => { try { ytPlayer.previousVideo(); armPlayWatchdog(); } catch {} });
+  $next.addEventListener('click', () => { try { ytPlayer.nextVideo(); armPlayWatchdog(); } catch {} });
+  $mute.addEventListener('click', () => { try { if (ytPlayer.isMuted()) { ytPlayer.unMute(); setMuteUI(false); } else { ytPlayer.mute(); setMuteUI(true); } } catch {} });
   $vol.addEventListener('input', () => { try { ytPlayer.setVolume(Number($vol.value)); } catch {} });
 
-  // Keyboard shortcuts: Space=Play/Pause, M=Mute, Shift+Left/Right=Prev/Next
   document.addEventListener('keydown', (ev) => {
     if (ev.code === 'Space') { ev.preventDefault(); $play.click(); }
     else if (ev.key.toLowerCase() === 'm') { $mute.click(); }
@@ -522,6 +567,53 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.addEventListener(ev, bumpActivity, {passive:true})
   );
   bumpActivity();
+</script>
+
+<!-- Fullscreen toggle logic with SVG icon swap -->
+<script>
+  function isFullscreen(){ return !!document.fullscreenElement; }
+  async function enterFullscreen(){ try{ await document.documentElement.requestFullscreen({navigationUI:'hide'}); }catch(e){ console.warn('requestFullscreen failed:', e); } }
+  async function exitFullscreen(){ try{ await document.exitFullscreen(); }catch(e){ console.warn('exitFullscreen failed:', e); } }
+
+  const fsBtn     = document.getElementById('fs-toggle');
+  const enterIcon = document.getElementById('fs-icon-enter');
+  const exitIcon  = document.getElementById('fs-icon-exit');
+
+  function updateFsUI(){
+    const on = isFullscreen();
+    if (fsBtn){
+      fsBtn.title = on ? 'Minimize (exit fullscreen)' : 'Fullscreen';
+    }
+    if (enterIcon && exitIcon){
+      enterIcon.style.display = on ? 'none' : '';
+      exitIcon.style.display  = on ? '' : 'none';
+    }
+  }
+
+  if (!fsBtn) {
+    console.warn('fs-toggle button not found in DOM');
+  } else {
+    fsBtn.addEventListener('click', async () => {
+      try {
+        if (isFullscreen()) await exitFullscreen();
+        else await enterFullscreen();
+      } catch (e) {
+        console.warn('Fullscreen toggle failed:', e);
+      } finally {
+        updateFsUI();
+      }
+    });
+    document.addEventListener('fullscreenchange', updateFsUI);
+    updateFsUI();
+  }
+
+  // Keyboard shortcut: F toggles fullscreen
+  document.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      fsBtn?.click();
+    }
+  });
 </script>
 """
 
