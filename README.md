@@ -5,6 +5,7 @@ As of March/April 2025, Google removed/blocked shared-album methods in the old L
 
 ```
 google-photos-screensaver/
+|-- .env
 ├── app.py
 ├── gphotos-screensaver.service
 ├── kiosk.service
