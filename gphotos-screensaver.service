@@ -1,17 +1,26 @@
-# /etc/systemd/system/gphotos-screensaver.service
 [Unit]
-Description=Google Photos Screensaver (Flask Picker API)
+Description=Google Photos Screensaver (Flask app)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=<<YOUR USERNAME>>
-WorkingDirectory=/home/<<YOUR USERNAME>>/google-photos-screensaver
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/google-photos-screensaver
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/<<YOUR USERNAME>>/google-photos-screensaver/.venv/bin/python app.py
+Environment=FLASK_ENV=production
+# Optional .env file; uncomment if you use it
+# EnvironmentFile=/home/%i/google-photos-screensaver/.env
+ExecStart=/usr/bin/python3 /home/%i/google-photos-screensaver/app.py
 Restart=always
 RestartSec=3
+
+# Resource limits (optional)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
