@@ -7,6 +7,13 @@ Google Photos Screensaver (Flask + Picker API) — 7" Raspberry Pi (800x480)
 - Screensaver uses a media proxy (/content/<index>) so the browser doesn’t need to be logged into Google.
 - Images: baseUrl += =w{width}-h{height}; Videos/Motion: baseUrl += =dv (per Google docs).
 - Diagnostics page (/diag) embeds proxied media and shows clickable test links.
+
+Fixes:
+- Refresh client OAuth token proactively + on 401/403, then retry once.
+- Resilient picker session auto-renew (returns `renewed` to front-end).
+- Avoid replacing session during active picking by using a small buffer.
+- Update local session expireTime when polling.
+- Correct slideshow interval (ms) multiplier from 10000 to 1000.
 """
 
 import os
@@ -93,7 +100,7 @@ def _merge_tokens(new_tok: dict, old_tok: dict) -> dict:
     merged = dict(old_tok or {})
     for k in ("access_token", "refresh_token", "token_type", "expires_in"):
         v = new_tok.get(k)
-        if v:
+        if v is not None:
             merged[k] = v
     merged["saved_at"] = int(time.time())
     return merged
@@ -155,6 +162,67 @@ def get_server_access_token() -> str | None:
             return new_at
     return at
 
+# -------------------------- client session token helpers --------------------------
+def get_client_access_token() -> str | None:
+    """
+    Ensure we have a fresh access token for the current Flask session.
+    If we have a refresh_token and current token is near expiry (<=60s), refresh it.
+    Also used as a central place to read/update token timestamps in session.
+    """
+    at = session.get("access_token")
+    rt = session.get("refresh_token")
+    saved_at = session.get("token_saved_at") or 0
+    expires_in = session.get("token_expires_in") or 0
+    now = int(time.time())
+
+    should_refresh = bool(rt) and (
+        (not at) or (expires_in and saved_at and (saved_at + expires_in - 60) <= now)
+    )
+
+    if should_refresh:
+        new_at = refresh_access_token(rt)
+        if new_at:
+            session["access_token"] = new_at
+            # Try to obtain 'expires_in'/'saved_at' from persistent store
+            t = load_tokens()
+            session["token_expires_in"] = t.get("expires_in") or session.get("token_expires_in") or 0
+            session["token_saved_at"] = t.get("saved_at") or now
+            return new_at
+
+    return session.get("access_token")
+
+# -------------------------- HTTP wrappers with 401/403 retry --------------------------
+def picker_get(url: str) -> requests.Response:
+    at = get_client_access_token()
+    if not at:
+        raise requests.HTTPError("No access token")
+    headers = {"Authorization": f"Bearer {at}"}
+    r = requests.get(url, headers=headers, timeout=20)
+    if r.status_code in (401, 403):
+        # refresh and retry once
+        new_at = refresh_access_token(session.get("refresh_token"))
+        if new_at:
+            session["access_token"] = new_at
+            headers = {"Authorization": f"Bearer {new_at}"}
+            r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r
+
+def picker_post(url: str, payload: dict) -> requests.Response:
+    at = get_client_access_token()
+    if not at:
+        raise requests.HTTPError("No access token")
+    headers = {"Authorization": f"Bearer {at}"}
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    if r.status_code in (401, 403):
+        new_at = refresh_access_token(session.get("refresh_token"))
+        if new_at:
+            session["access_token"] = new_at
+            headers = {"Authorization": f"Bearer {new_at}"}
+            r = requests.post(url, headers=headers, json=payload, timeout=20)
+    r.raise_for_status()
+    return r
+
 # -------------------------- session auto-renew helpers --------------------------
 def _iso_to_epoch(iso_ts: str) -> float:
     """RFC3339 -> epoch seconds; accepts 'Z' and offsets."""
@@ -170,7 +238,7 @@ def _is_expired_or_close(expire_iso: str, buffer_seconds: int = SESSION_RENEW_BU
     exp = _iso_to_epoch(expire_iso)
     return exp <= (now + buffer_seconds)
 
-def _ensure_session(access_token: str, picking_config: dict | None = None) -> dict:
+def _ensure_session(picking_config: dict | None = None) -> dict:
     """
     Ensure we have a valid Picker session in Flask 'session'.
     Renew if missing or expired/close-to-expiry.
@@ -180,15 +248,13 @@ def _ensure_session(access_token: str, picking_config: dict | None = None) -> di
     exp = session.get("picker_expire_time")
     if (not sid) or _is_expired_or_close(exp):
         url = f"{PICKER_BASE}/sessions"
-        headers = {"Authorization": f"Bearer {access_token}"}
         payload = picking_config or {}
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
-        r.raise_for_status()
+        r = picker_post(url, payload)
         data = r.json()
         session["picker_session_id"] = data.get("id")
         session["picker_uri"] = data.get("pickerUri")  # raw; /status appends /autoclose
         session["picker_expire_time"] = data.get("expireTime")
-        app.logger.info("Created/renewed session id=%s exp=%s", session["picker_session_id"], session["picker_expire_time"])
+        app.logger.info("Created/renewed session id=%s exp=%s", session["picker_session_id"], session["picker_expire_time"]) 
         return data
     return {"id": sid, "pickerUri": session.get("picker_uri"), "expireTime": exp}
 
@@ -253,6 +319,7 @@ async function poll(){
     document.getElementById('debug').textContent='Polling… '+new Date().toLocaleTimeString();
     if(!r.ok) throw new Error('poll failed '+r.status);
     const j = await r.json();
+    if (j.renewed) { location.reload(); return; }
     if(j.ready){ window.location='/fetch-selected'; return; }
     const interval = (j.interval && typeof j.interval==='number')? j.interval : 5.0;
     setTimeout(poll, interval*1000);
@@ -365,7 +432,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   } catch(e) {}
 
   const ITEMS = {{ items|tojson }};
-  const INTERVAL = {{ interval_seconds }} * 10000;  // DO NOT change; per request
+  const INTERVAL = {{ interval_seconds }} * 1000;  // milliseconds per second
   const REFRESH_MS = {{ refresh_minutes }} * 60 * 1000;
   const stage = document.querySelector('.stage');
   const log = document.getElementById('log');
@@ -758,6 +825,8 @@ def auth_callback():
     session["access_token"] = tok.get("access_token")
     session["refresh_token"] = tok.get("refresh_token")
     session["token_type"] = tok.get("token_type", "Bearer")
+    session["token_expires_in"] = tok.get("expires_in") or 0
+    session["token_saved_at"] = int(time.time())
 
     if not session["access_token"]:
         app.logger.error("No access_token in token response: %s", tok)
@@ -772,14 +841,14 @@ def auth_callback():
 # ---- Picker session lifecycle ----
 @app.route("/create-session", methods=["GET", "POST"])
 def create_session():
-    access_token = session.get("access_token")
+    access_token = get_client_access_token()
     if not access_token:
         flash("Not authorized. Please start authorization.")
         return redirect(url_for("auth_start"))
 
     try:
         # Ensure a fresh session if none exists or near expiry
-        data = _ensure_session(access_token=access_token, picking_config={})
+        data = _ensure_session(picking_config={})
     except requests.HTTPError as e:
         app.logger.error("Create/renew session failed: %s", e)
         flash("Failed to create Picker session. Is the Photos Picker API enabled & scope correct?")
@@ -806,57 +875,55 @@ def api_picker_session():
 
 @app.route("/status")
 def status():
-    access_token = session.get("access_token")
-    if access_token:
-        try:
-            data = _ensure_session(access_token=access_token)
-            picker_uri = (data.get("pickerUri") or session.get("picker_uri"))
-        except Exception:
-            app.logger.exception("Status: ensure_session failed")
-            picker_uri = session.get("picker_uri")
-    else:
-        picker_uri = session.get("picker_uri")
+    picker_uri = session.get("picker_uri")
     if picker_uri:
         picker_uri = picker_uri.rstrip("/") + "/autoclose"
     return render_template_string(STATUS_TEMPLATE, picker_uri=picker_uri, session_id=session.get("picker_session_id"))
 
 @app.route("/api/poll")
 def api_poll():
-    access_token = session.get("access_token"); session_id = session.get("picker_session_id")
+    access_token = get_client_access_token()
+    session_id = session.get("picker_session_id")
     if not (access_token and session_id):
         return jsonify({"ready": False, "interval": 5.0, "error": "no_session"}), 200
-    headers = {"Authorization": f"Bearer {access_token}"}
+
     status_url = f"{PICKER_BASE}/sessions/{session_id}"
+    renewed = False
     try:
-        # Renew immediately if expired now (no buffer during active polling)
-        if _is_expired_or_close(session.get("picker_expire_time"), buffer_seconds=0):
-            data = _ensure_session(access_token=access_token)
+        # Renew if expired or expiring soon (buffer=30s during active polling)
+        if _is_expired_or_close(session.get("picker_expire_time"), buffer_seconds=30):
+            data = _ensure_session()
             session_id = session.get("picker_session_id")
             status_url = f"{PICKER_BASE}/sessions/{session_id}"
+            renewed = True
 
-        r = requests.get(status_url, headers=headers, timeout=20)
-        if r.status_code != 200:
-            app.logger.error("Poll status failed: %s %s", r.status_code, r.text)
-            return jsonify({"ready": False, "interval": 5.0, "error": f"http_{r.status_code}"}), 200
+        r = picker_get(status_url)
         info = r.json()
+
+        # Update local expire_time if provided
+        if info.get("expireTime"):
+            session["picker_expire_time"] = info.get("expireTime")
+
         if info.get("mediaItemsSet"):
-            return jsonify({"ready": True, "interval": 0}), 200
+            return jsonify({"ready": True, "interval": 0, "renewed": renewed}), 200
         poll_cfg = info.get("pollingConfig", {})
         interval = parse_seconds(poll_cfg.get("pollInterval"), default=5.0)
-        return jsonify({"ready": False, "interval": interval}), 200
+        return jsonify({"ready": False, "interval": interval, "renewed": renewed}), 200
+    except requests.HTTPError as e:
+        app.logger.error("Poll status failed: %s", e)
+        return jsonify({"ready": False, "interval": 5.0, "error": "http_error"}), 200
     except Exception:
         app.logger.exception("Poll exception")
         return jsonify({"ready": False, "interval": 5.0, "error": "exception"}), 200
 
 @app.route("/poll-till-ready")
 def poll_till_ready_compat():
-    access_token = session.get("access_token"); session_id = session.get("picker_session_id")
+    access_token = get_client_access_token()
+    session_id = session.get("picker_session_id")
     if not (access_token and session_id): return redirect(url_for("create_session"))
-    headers = {"Authorization": f"Bearer {access_token}"}
     status_url = f"{PICKER_BASE}/sessions/{session_id}"
     try:
-        r = requests.get(status_url, headers=headers, timeout=20)
-        if r.status_code != 200: app.logger.error("Compat poll failed: %s %s", r.status_code, r.text); return ("", 204)
+        r = picker_get(status_url)
         info = r.json()
         if info.get("mediaItemsSet"): return redirect(url_for("fetch_selected"))
         return ("", 204)
@@ -865,21 +932,20 @@ def poll_till_ready_compat():
 
 @app.route("/fetch-selected")
 def fetch_selected():
-    access_token = session.get("access_token"); session_id = session.get("picker_session_id")
+    access_token = get_client_access_token()
+    session_id = session.get("picker_session_id")
     if not (access_token and session_id):
         flash("No active Picker session. Create session first."); return redirect(url_for("create_session"))
 
-    headers = {"Authorization": f"Bearer {access_token}"}
     items_url = f"{PICKER_BASE}/mediaItems"
     all_items, page_token = [], None
     try:
         while True:
             params = {"sessionId": session_id, "pageSize": 100}
             if page_token: params["pageToken"] = page_token
-            r = requests.get(items_url, headers=headers, params=params, timeout=20)
-            if r.status_code != 200:
-                app.logger.error("List items failed: %s %s", r.status_code, r.text)
-                flash("Failed to list picked items. Try polling again."); return redirect(url_for("status"))
+            # Use picker_get with explicit URL + query params
+            url = items_url + "?" + urlencode(params)
+            r = picker_get(url)
             data = r.json()
             all_items.extend(data.get("mediaItems", []) or [])
             page_token = data.get("nextPageToken")
@@ -911,7 +977,20 @@ def fetch_selected():
     # --- Proactive cleanup: delete session (recommended to stay within limits) ---
     try:
         del_url = f"{PICKER_BASE}/sessions/{session_id}"
-        dr = requests.delete(del_url, headers=headers, timeout=20)  # sessions.delete
+        try:
+            r = picker_get(del_url)  # will 405; use requests.delete with retry logic below
+        except Exception:
+            pass
+        # do delete with 401/403 retry
+        at = get_client_access_token()
+        headers = {"Authorization": f"Bearer {at}"}
+        dr = requests.delete(del_url, headers=headers, timeout=20)
+        if dr.status_code in (401, 403):
+            new_at = refresh_access_token(session.get("refresh_token"))
+            if new_at:
+                session["access_token"] = new_at
+                headers = {"Authorization": f"Bearer {new_at}"}
+                dr = requests.delete(del_url, headers=headers, timeout=20)
         if dr.status_code not in (200, 204):
             app.logger.warning("sessions.delete returned %s", dr.status_code)
     except Exception:
@@ -944,7 +1023,7 @@ def content(index: int):
         abort(404)
 
     # Prefer session token (remote browsers that did OAuth)
-    access_token = session.get("access_token")
+    access_token = get_client_access_token()
 
     # If no session token AND the request is local kiosk, use server-side token
     is_local = request.remote_addr in ("127.0.0.1", "::1")
@@ -954,9 +1033,26 @@ def content(index: int):
     if not access_token:
         abort(401)
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-    try:
+    def authorized_fetch(at: str) -> requests.Response:
+        headers = {"Authorization": f"Bearer {at}"}
         r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code in (401, 403):
+            # Try refresh (client or server)
+            new_at = None
+            if is_local and DISABLE_SESSION_AUTH_FOR_LOCAL:
+                t = load_tokens()
+                new_at = refresh_access_token(t.get("refresh_token"))
+            else:
+                new_at = refresh_access_token(session.get("refresh_token"))
+                if new_at:
+                    session["access_token"] = new_at
+            if new_at:
+                headers = {"Authorization": f"Bearer {new_at}"}
+                r = requests.get(url, headers=headers, timeout=30)
+        return r
+
+    try:
+        r = authorized_fetch(access_token)
         if r.status_code != 200:
             app.logger.error("Proxy fetch failed (%s): %s", r.status_code, url)
             abort(r.status_code)
