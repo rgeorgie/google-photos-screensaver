@@ -1,19 +1,13 @@
 
 #!/usr/bin/env python3
 """
-Google Photos Screensaver (Flask + Picker API) — 7" Raspberry Pi (800x480)
-- Status page opens Google Photos Picker (autoclose) and auto-polls the session.
-- Fetches picked items and saves them locally.
-- Screensaver uses a media proxy (/content/<index>) so the browser doesn’t need to be logged into Google.
-- Images: baseUrl += =w{width}-h{height}; Videos/Motion: baseUrl += =dv (per Google docs).
-- Diagnostics page (/diag) embeds proxied media and shows clickable test links.
+Google Photos Screensaver (Flask + Picker API) — Raspberry Pi
 
-Fixes:
-- Refresh client OAuth token proactively + on 401/403, then retry once.
-- Resilient picker session auto-renew (returns `renewed` to front-end).
-- Avoid replacing session during active picking by using a small buffer.
-- Update local session expireTime when polling.
-- Correct slideshow interval (ms) multiplier from 10000 to 1000.
+Adds durable local storage so the slideshow runs 24/7 without re‑auth:
+- Downloads picked media to **/cache/photos/** (configurable via `CACHE_DIR`) and builds `cache_index.json`.
+- Screensaver prefers local cached files via `/local/<index>`; falls back to proxy `/content/<index>` if no cache yet.
+- HEIC/HEIF → JPEG conversion during download if `pillow-heif` is present.
+- YouTube music hardened: single‑video loop via `playlist=VIDEO_ID`, playlist restart on END, watchdog.
 """
 
 import os
@@ -22,13 +16,28 @@ import json
 import logging
 from urllib.parse import urlencode
 from datetime import datetime
+import io
+import shutil
 
 import requests
 from flask import (
     Flask, redirect, request, session, url_for,
-    render_template_string, flash, jsonify, Response, abort
+    render_template_string, flash, jsonify, Response, abort, send_file
 )
 from dotenv import load_dotenv
+
+# Optional HEIC/HEIF decoding via Pillow + pillow-heif
+try:
+    from PIL import Image
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+        HEIF_ENABLED = True
+    except Exception:
+        HEIF_ENABLED = False
+except Exception:
+    Image = None
+    HEIF_ENABLED = False
 
 load_dotenv()
 
@@ -48,7 +57,7 @@ REFRESH_MINUTES_DEFAULT = int(os.getenv("REFRESH_MINUTES", "60"))  # baseUrl val
 
 # --- YouTube music config (set via environment) ---
 YT_VIDEO_ID = os.getenv("YT_VIDEO_ID", "")           # e.g., "utbIKghScn8"
-YT_PLAYLIST_ID = os.getenv("YT_PLAYLIST_ID", "")     # e.g., "RDutbIKghScn8"
+YT_PLAYLIST_ID = os.getenv("YT_PLAYLIST_ID", "")     # e.g., "PLxxxxxxxx"
 YT_VOLUME = int(os.getenv("YT_VOLUME", "60"))        # 0..100
 YT_HIDE_VIDEO = os.getenv("YT_HIDE_VIDEO", "true").lower() == "true"
 
@@ -59,21 +68,60 @@ DISABLE_SESSION_AUTH_FOR_LOCAL = os.getenv("DISABLE_SESSION_AUTH_FOR_LOCAL", "tr
 # --- Auto-renew buffer for Picker sessions ---
 SESSION_RENEW_BUFFER_SEC = int(os.getenv("SESSION_RENEW_BUFFER_SEC", "60"))  # renew if expiring within next 60s
 
+# Force crop param to encourage JPEG derivatives
+FORCE_CROP_PARAM = os.getenv("FORCE_CROP_PARAM", "true").lower() == "true"
+
+# --- Local cache ---
+CACHE_DIR = os.getenv("CACHE_DIR", "/cache/photos/")
+CACHE_INDEX = os.path.join(CACHE_DIR, "cache_index.json")
+DL_WIDTH = int(os.getenv("DL_WIDTH", "1280"))
+DL_HEIGHT = int(os.getenv("DL_HEIGHT", "800"))
+
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 logging.basicConfig(level=logging.INFO)
 
-
 # -------------------------- utilities --------------------------
+def ensure_cache_dir():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except Exception:
+        app.logger.exception("Failed to create CACHE_DIR %s", CACHE_DIR)
+        raise
+
+
+def read_cache_index():
+    ensure_cache_dir()
+    if not os.path.exists(CACHE_INDEX):
+        return []
+    try:
+        with open(CACHE_INDEX, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        app.logger.exception("Failed to read cache_index.json")
+        return []
+
+
+def write_cache_index(items):
+    ensure_cache_dir()
+    try:
+        with open(CACHE_INDEX, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception:
+        app.logger.exception("Failed to write cache_index.json")
+
+
 def save_media_items(items: list) -> None:
     with open(SELECTION_STORE, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
+
 
 def load_media_items() -> list:
     if not os.path.exists(SELECTION_STORE):
         return []
     with open(SELECTION_STORE, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def parse_seconds(d, default=5.0):
     if isinstance(d, (int, float)): return float(d)
@@ -82,18 +130,17 @@ def parse_seconds(d, default=5.0):
         except: return default
     return default
 
+
 def build_media_url(item: dict, kind: str, w: int = 800, h: int = 480) -> str:
-    """
-    Build a Google Photos content URL from baseUrl + parameters.
-    kind: 'image' or 'video'
-    """
     base = item.get("baseUrl") or ""
     mt = (item.get("mimeType") or "").lower()
     if not base:
         return ""
     if kind == "video" or mt.startswith("video/") or "motion" in mt:
         return base + "=dv"  # video stream via '=dv' (not compatible with w/h)
-    return f"{base}=w{w}-h{h}"  # image bytes via width/height params
+    if FORCE_CROP_PARAM:
+        return f"{base}=w{w}-h{h}-c"
+    return f"{base}=w{w}-h{h}"
 
 # -------- token persistence & refresh (server-side) ----------
 def _merge_tokens(new_tok: dict, old_tok: dict) -> dict:
@@ -104,6 +151,7 @@ def _merge_tokens(new_tok: dict, old_tok: dict) -> dict:
             merged[k] = v
     merged["saved_at"] = int(time.time())
     return merged
+
 
 def save_tokens(tok: dict) -> None:
     old = {}
@@ -121,6 +169,7 @@ def save_tokens(tok: dict) -> None:
     except Exception:
         app.logger.exception("Failed to persist tokens.json")
 
+
 def load_tokens() -> dict:
     if not os.path.exists(TOKENS_STORE):
         return {}
@@ -130,6 +179,7 @@ def load_tokens() -> dict:
     except Exception:
         app.logger.exception("Failed to read tokens.json")
         return {}
+
 
 def refresh_access_token(refresh_token: str) -> str | None:
     if not refresh_token:
@@ -152,6 +202,7 @@ def refresh_access_token(refresh_token: str) -> str | None:
         app.logger.exception("Refresh token exception")
         return None
 
+
 def get_server_access_token() -> str | None:
     t = load_tokens()
     rt = t.get("refresh_token")
@@ -164,11 +215,6 @@ def get_server_access_token() -> str | None:
 
 # -------------------------- client session token helpers --------------------------
 def get_client_access_token() -> str | None:
-    """
-    Ensure we have a fresh access token for the current Flask session.
-    If we have a refresh_token and current token is near expiry (<=60s), refresh it.
-    Also used as a central place to read/update token timestamps in session.
-    """
     at = session.get("access_token")
     rt = session.get("refresh_token")
     saved_at = session.get("token_saved_at") or 0
@@ -183,7 +229,6 @@ def get_client_access_token() -> str | None:
         new_at = refresh_access_token(rt)
         if new_at:
             session["access_token"] = new_at
-            # Try to obtain 'expires_in'/'saved_at' from persistent store
             t = load_tokens()
             session["token_expires_in"] = t.get("expires_in") or session.get("token_expires_in") or 0
             session["token_saved_at"] = t.get("saved_at") or now
@@ -199,7 +244,6 @@ def picker_get(url: str) -> requests.Response:
     headers = {"Authorization": f"Bearer {at}"}
     r = requests.get(url, headers=headers, timeout=20)
     if r.status_code in (401, 403):
-        # refresh and retry once
         new_at = refresh_access_token(session.get("refresh_token"))
         if new_at:
             session["access_token"] = new_at
@@ -207,6 +251,7 @@ def picker_get(url: str) -> requests.Response:
             r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     return r
+
 
 def picker_post(url: str, payload: dict) -> requests.Response:
     at = get_client_access_token()
@@ -225,25 +270,20 @@ def picker_post(url: str, payload: dict) -> requests.Response:
 
 # -------------------------- session auto-renew helpers --------------------------
 def _iso_to_epoch(iso_ts: str) -> float:
-    """RFC3339 -> epoch seconds; accepts 'Z' and offsets."""
     if not iso_ts:
         return 0.0
     return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).timestamp()
 
+
 def _is_expired_or_close(expire_iso: str, buffer_seconds: int = SESSION_RENEW_BUFFER_SEC) -> bool:
-    """True if session has expired or will expire within buffer."""
     if not expire_iso:
         return True
     now = time.time()
     exp = _iso_to_epoch(expire_iso)
     return exp <= (now + buffer_seconds)
 
+
 def _ensure_session(picking_config: dict | None = None) -> dict:
-    """
-    Ensure we have a valid Picker session in Flask 'session'.
-    Renew if missing or expired/close-to-expiry.
-    Returns the API response dict (id/pickerUri/expireTime/...).
-    """
     sid = session.get("picker_session_id")
     exp = session.get("picker_expire_time")
     if (not sid) or _is_expired_or_close(exp):
@@ -252,7 +292,7 @@ def _ensure_session(picking_config: dict | None = None) -> dict:
         r = picker_post(url, payload)
         data = r.json()
         session["picker_session_id"] = data.get("id")
-        session["picker_uri"] = data.get("pickerUri")  # raw; /status appends /autoclose
+        session["picker_uri"] = data.get("pickerUri")
         session["picker_expire_time"] = data.get("expireTime")
         app.logger.info("Created/renewed session id=%s exp=%s", session["picker_session_id"], session["picker_expire_time"]) 
         return data
@@ -263,7 +303,6 @@ def _ensure_session(picking_config: dict | None = None) -> dict:
 def handle_any_error(e):
     app.logger.exception("Unhandled exception")
     return ("Internal Server Error", 500)
-
 
 # -------------------------- templates --------------------------
 PICK_TEMPLATE = """
@@ -309,7 +348,7 @@ a.button{display:inline-block;padding:.6rem 1rem;border:1px solid #08c;border-ra
   <p><em>No picker URI found; please <a href="{{ url_for('create_session') }}">create a new session</a>.</em></p>
 {% endif %}
 {% if session_id %}<p>Session ID: <code>{{ session_id }}</code></p>{% endif %}
-<p class="muted">In Google Photos: search your album → open it → <strong>select photos/videos</strong> → press <strong>Done</strong>.</p>
+<p class="muted">In Google Photos: search your album → open it → <strong>select photos/videos</strong> → press <strong>Done</strong>. Selected items will be downloaded to <code>{{ cache_dir }}</code>.</p>
 {% with messages = get_flashed_messages() %}{% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}{% endwith %}
 <div id="debug"></div>
 <script>
@@ -340,82 +379,28 @@ SCREENSAVER_TEMPLATE = """
 <style>
 html,body{height:100%;width:100%;margin:0;background:#000;overflow:hidden;cursor:none}
 .stage{position:fixed;inset:0;display:grid;place-items:center}
-
-/* FILL SCREEN: photos/videos occupy the entire viewport */
-img,video{
-  width:100vw; height:100vh;
-  object-fit:scale-down;       /* crop to fill; no letterboxing */
-  background:#000;
-}
-
+img,video{width:100vw;height:100vh;object-fit:scale-down;background:#000}
 .fade{animation:fade .6s ease}@keyframes fade{from{opacity:0}to{opacity:1}}
 .empty{color:#ccc;font-family:system-ui,sans-serif}
 #log{position:fixed;left:8px;bottom:8px;color:#888;font:12px ui-monospace,monospace;max-width:95vw;white-space:pre-wrap}
-
-/* Hidden YouTube music player (>=200x200 per IFrame API guidance) */
-#yt-sound {
-  position:fixed; left:-10000px; top:-10000px;
-  width:300px; height:300px; opacity:0; pointer-events:none;
-}
-
-/* Controls overlay */
-#yt-controls {
-  position:fixed; left:12px; bottom:12px;
-  display:flex; align-items:center; gap:8px;
-  background:rgba(0,0,0,0.55);
-  border:1px solid rgba(255,255,255,0.15);
-  border-radius:10px;
-  padding:8px 10px;
-  color:#eee; font:13px system-ui, sans-serif;
-  z-index: 10000;
-  transition: opacity .25s ease;
-  cursor: default; /* show cursor over controls */
-}
-#yt-controls button {
-  border:none; outline:none;
-  padding:6px 8px; border-radius:6px;
-  background:#1a1a1a; color:#fff;
-  cursor:pointer; display:flex; align-items:center; gap:6px;
-}
-#yt-controls button:hover { background:#333; }
-#yt-controls .spacer { width:1px; height:22px; background:#555; opacity:.4; }
-#yt-controls input[type="range"] {
-  width:120px;
-  accent-color:#08c;
-}
-#yt-controls .label { max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.hide-cursor { cursor:none; }
-
-/* Auto-hide controls after inactivity */
-body.idle #yt-controls { opacity:0; pointer-events:none; }
+#yt-sound{position:fixed;left:-10000px;top:-10000px;width:300px;height:300px;opacity:0;pointer-events:none}
+#yt-controls{position:fixed;left:12px;bottom:12px;display:flex;gap:8px;background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:8px 10px;color:#eee;font:13px system-ui,sans-serif;z-index:10000;transition:opacity .25s}
+#yt-controls button{border:none;padding:6px 8px;border-radius:6px;background:#1a1a1a;color:#fff;cursor:pointer}
+#yt-controls .spacer{width:1px;height:22px;background:#555;opacity:.4}
+#yt-controls input[type=range]{width:120px;accent-color:#08c}
+body.idle #yt-controls{opacity:0;pointer-events:none}
 </style>
-
 <div class="stage"></div><div id="log"></div>
 <div id="yt-sound"></div>
-
 <div id="yt-controls">
-  <button id="yt-prev"     title="Previous (Shift+Left)">⏮</button>
-  <button id="yt-play"     title="Play/Pause (Space)">⏯</button>
-  <button id="yt-next"     title="Next (Shift+Right)">⏭</button>
+  <button id="yt-prev" title="Previous (Shift+Left)">⏮</button>
+  <button id="yt-play" title="Play/Pause (Space)">⏯</button>
+  <button id="yt-next" title="Next (Shift+Right)">⏭</button>
   <span class="spacer"></span>
-  <button id="yt-mute"     title="Mute/Unmute (M)">🔈</button>
-  <input  id="yt-volume"   type="range" min="0" max="100" step="1" title="Volume">
+  <button id="yt-mute" title="Mute/Unmute (M)">🔈</button>
+  <input id="yt-volume" type="range" min="0" max="100" step="1" title="Volume">
   <span class="spacer"></span>
-  <span  id="yt-label"     class="label" title="Now playing">Now playing…</span>
-  <!-- Fullscreen toggle with SVG icons -->
-  <span class="spacer"></span>
-  <button id="fs-toggle"   title="Fullscreen / Minimize" aria-label="Toggle fullscreen">
-    <!-- ENTER FULLSCREEN ICON -->
-    <svg id="fs-icon-enter" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-        d="M3 10V3h7M21 14v7h-7M10 21H3v-7M21 3v7"/>
-    </svg>
-    <!-- EXIT FULLSCREEN ICON -->
-    <svg id="fs-icon-exit" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" style="display:none">
-      <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-        d="M7 7h4V3M17 17h-4v4M7 17h4v4M17 7h-4V3"/>
-    </svg>
-  </button>
+  <span id="yt-label" class="label" title="Now playing">Now playing…</span>
 </div>
 
 <!-- YouTube IFrame API -->
@@ -423,306 +408,101 @@ body.idle #yt-controls { opacity:0; pointer-events:none; }
 
 <script>
 document.addEventListener('DOMContentLoaded', async () => {
-  // Best-effort: enter FS on load (Chromium --kiosk may already force fullscreen)
-  try {
-    const el=document.documentElement;
-    if(!document.fullscreenElement && el.requestFullscreen){
-      await el.requestFullscreen({navigationUI:'hide'});
-    }
-  } catch(e) {}
-
-  const ITEMS = {{ items|tojson }};
-  const INTERVAL = {{ interval_seconds }} * 1000;  // milliseconds per second
-  const REFRESH_MS = {{ refresh_minutes }} * 60 * 1000;
+  const USE_LOCAL   = {{ use_local|tojson }};
+  const LOCAL_ITEMS = {{ local_items|tojson }};   // [{path, kind, filename}]
+  const REMOTE_ITEMS= {{ remote_items|tojson }};  // [{baseUrl,mimeType,filename}]
+  const INTERVAL    = {{ interval_seconds }} * 1000;
+  const REFRESH_MS  = {{ refresh_minutes }} * 60 * 1000;
   const stage = document.querySelector('.stage');
   const log = document.getElementById('log');
   function logMsg(m){ log.textContent = m; }
 
-  if(!ITEMS || !ITEMS.length){
-    stage.innerHTML='<div class="empty">No items selected yet.<br/>Go back and pick photos.</div>';
-    logMsg('No ITEMS'); return;
+  let consecutiveErrors = 0;
+  function bumpError(tag, url){
+    consecutiveErrors++;
+    logMsg(tag+' error: '+url+' (count='+consecutiveErrors+')');
+    if (consecutiveErrors >= 3) location.reload();
   }
+  function resetErrors(){ consecutiveErrors = 0; }
 
-  // Use real viewport size (no hard clamp)
-  function getWH(){
-    const w = Math.max(1, Math.round(window.innerWidth || 800));
-    const h = Math.max(1, Math.round(window.innerHeight || 480));
-    return {w,h};
-  }
+  function viewWH(){ return { w: Math.max(1, Math.round(window.innerWidth || 800)), h: Math.max(1, Math.round(window.innerHeight || 480))}; }
 
-  function isVideo(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startsWith('video/') || mt.includes('motion'); }
-  function urlFor(it, kind){
-    const {w,h} = getWH();
-    const idx = ITEMS.indexOf(it);
-    const q = new URLSearchParams({kind, w:String(w), h:String(h)});
-    return '/content/'+idx+'?'+q.toString();
-  }
+  function isVideoRemote(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startsWith('video/') || mt.includes('motion'); }
+  function remoteUrlFor(it, kind){ const {w,h}=viewWH(); const idx=REMOTE_ITEMS.indexOf(it); const q=new URLSearchParams({kind,w:String(w),h:String(h)}); return '/content/'+idx+'?'+q.toString(); }
 
   let idx = 0;
-  async function show(i){
-    const it = ITEMS[i]; if(!it) return;
-    stage.innerHTML = '';
-    let el, kind = isVideo(it) ? 'video' : 'image';
-    const url = urlFor(it, kind);
-
-    const onError = async () => {
-      const fallback = urlFor(it, 'image');
-      const img = document.createElement('img');
-      img.src = fallback; img.alt = it.filename||'';
-      img.addEventListener('error', () => logMsg('Fallback image error: '+fallback));
-      img.addEventListener('load',  () => logMsg('Fallback image loaded: '+(it.filename||'')));
-      stage.innerHTML=''; stage.appendChild(img);
-    };
-
-    if(kind === 'video'){
-      el = document.createElement('video');
-      el.src = url; el.autoplay = true; el.loop = true; el.muted = true; el.playsInline = true;
-      el.addEventListener('error', async () =>{ logMsg('Video error: '+url); await onError(); });
-      el.addEventListener('loadeddata', () => logMsg('Playing video '+(it.filename||'')));
-    }else{
-      el = document.createElement('img');
-      el.src = url; el.alt = it.filename||'';
-      el.addEventListener('error', async () =>{ logMsg('Image error: '+url); await onError(); });
-      el.addEventListener('load', () => logMsg('Showing image '+(it.filename||'')));
+  async function showLocal(i){
+    const it = LOCAL_ITEMS[i]; if(!it) return;
+    stage.innerHTML=''; let el;
+    if (it.kind === 'video'){
+      el = document.createElement('video'); el.src = '/local/'+i; el.autoplay=true; el.loop=true; el.muted=true; el.playsInline=true;
+      el.addEventListener('error', () => bumpError('Video', el.src));
+      el.addEventListener('loadeddata', () => { logMsg('Playing video '+(it.filename||'')); resetErrors(); });
+    } else {
+      el = document.createElement('img'); el.src = '/local/'+i; el.alt=it.filename||'';
+      el.addEventListener('error', () => bumpError('Image', el.src));
+      el.addEventListener('load', () => { logMsg('Showing image '+(it.filename||'')); resetErrors(); });
     }
-
     el.className='fade'; stage.appendChild(el);
   }
 
+  async function showRemote(i){
+    const it = REMOTE_ITEMS[i]; if(!it) return;
+    stage.innerHTML=''; let el, kind = isVideoRemote(it) ? 'video' : 'image'; const url = remoteUrlFor(it, kind);
+    const onError = async () => { const fb = remoteUrlFor(it,'image'); const img=document.createElement('img'); img.src=fb; img.alt=it.filename||''; img.addEventListener('error',()=>logMsg('Fallback image error: '+fb)); img.addEventListener('load',()=>logMsg('Fallback image loaded: '+(it.filename||''))); stage.innerHTML=''; stage.appendChild(img); };
+    if (kind==='video'){
+      el=document.createElement('video'); el.src=url; el.autoplay=true; el.loop=true; el.muted=true; el.playsInline=true;
+      el.addEventListener('error', async ()=>{ logMsg('Video error: '+url); await onError(); });
+      el.addEventListener('loadeddata', ()=> logMsg('Playing video '+(it.filename||'')) );
+    } else {
+      el=document.createElement('img'); el.src=url; el.alt=it.filename||'';
+      el.addEventListener('error', async ()=>{ logMsg('Image error: '+url); await onError(); });
+      el.addEventListener('load', ()=> logMsg('Showing image '+(it.filename||'')) );
+    }
+    el.className='fade'; stage.appendChild(el);
+  }
+
+  const items = USE_LOCAL ? LOCAL_ITEMS : REMOTE_ITEMS;
+  if(!items || !items.length){
+    stage.innerHTML='<div class="empty">No items found. Pick & download first.</div>';
+    logMsg('No ITEMS'); return;
+  }
+
+  async function show(i){ if (USE_LOCAL) return showLocal(i); else return showRemote(i); }
   await show(idx);
-  setInterval(async () => { idx=(idx+1)%ITEMS.length; await show(idx); }, INTERVAL);
-  if(REFRESH_MS>0) setInterval(()=>{ logMsg('Refreshing to renew baseUrl…'); location.reload(); }, REFRESH_MS);
+  setInterval(async () => { idx=(idx+1)%items.length; await show(idx); }, INTERVAL);
+  if(!USE_LOCAL && REFRESH_MS>0) setInterval(()=>{ logMsg('Refreshing to renew baseUrl…'); location.reload(); }, REFRESH_MS);
 });
 </script>
 
-<!-- YouTube music player with controls and auto-skip watchdog -->
+<!-- YouTube music player (robust looping) -->
 <script>
   const YT_VIDEO_ID    = {{ yt_video_id|tojson }};
   const YT_PLAYLIST_ID = {{ yt_playlist_id|tojson }};
   const YT_VOLUME      = {{ yt_volume|tojson }};
-  const YT_HIDE_VIDEO  = {{ yt_hide_video|tojson }};
-
-  const $play   = document.getElementById('yt-play');
-  const $prev   = document.getElementById('yt-prev');
-  const $next   = document.getElementById('yt-next');
-  const $mute   = document.getElementById('yt-mute');
-  const $vol    = document.getElementById('yt-volume');
-  const $label  = document.getElementById('yt-label');
-
-  let ytPlayer = null;
-  let labelPollT = null;
-  let labelPollTries = 0;
-
-  // --- Auto-skip watchdog: if not PLAYING within timeout, skip to next ---
-  let playWatchdogT = null;
-  const WATCHDOG_MS = 10000;  // wait up to 10s for PLAYING
-
-  function armPlayWatchdog() {
-    clearTimeout(playWatchdogT);
-    playWatchdogT = setTimeout(() => {
-      try {
-        const st = ytPlayer.getPlayerState();
-        if (st !== YT.PlayerState.PLAYING) {
-          console.warn('Watchdog: not playing after', WATCHDOG_MS, 'ms -> nextVideo()');
-          ytPlayer.nextVideo();
-        }
-      } catch(e) {
-        console.warn('Watchdog check failed:', e);
-      }
-    }, WATCHDOG_MS);
-  }
-  function disarmPlayWatchdog() {
-    clearTimeout(playWatchdogT);
-    playWatchdogT = null;
-  }
-
-  function setPlayingUI(playing) { $play.textContent = playing ? '⏸' : '⏯'; }
-  function setMuteUI(muted)      { $mute.textContent = muted ? '🔇' : '🔈'; }
-
-  function fallbackLabel() {
-    try {
-      const idx = ytPlayer.getPlaylistIndex();
-      const list = ytPlayer.getPlaylist() || [];
-      if (idx != null && idx >= 0 && idx < list.length) {
-        return `Track ${idx+1}`;
-      }
-      const url = ytPlayer.getVideoUrl();
-      const m = /[?&]v=([^&]+)/.exec(url);
-      return m ? `Video ${m[1]}` : 'Now playing…';
-    } catch { return 'Now playing…'; }
-  }
-
-  function updateLabel(forceFallback=false) {
-    let title = '';
-    try { const d = ytPlayer.getVideoData(); title = (d && d.title) ? d.title.trim() : ''; } catch {}
-    $label.textContent = (title && !forceFallback) ? title : fallbackLabel();
-  }
-
-  function startLabelPoll() {
-    clearInterval(labelPollT);
-    labelPollTries = 0;
-    labelPollT = setInterval(() => {
-      labelPollTries++;
-      updateLabel();
-      if (labelPollTries >= 10) clearInterval(labelPollT);
-    }, 2000);
-  }
-
-  function onYouTubeIframeAPIReady() {
-    const baseVars = { autoplay:1, controls:0, disablekb:1, modestbranding:1, rel:0, fs:0, playsinline:1, loop:1, origin:location.origin };
-    let playerVars = { ...baseVars };
-
-    if (YT_VIDEO_ID && !YT_PLAYLIST_ID) {
-      playerVars.playlist = YT_VIDEO_ID; // loop single video
-      ytPlayer = new YT.Player('yt-sound', {
-        width:200, height:200, videoId:YT_VIDEO_ID, playerVars,
-        events:{ onReady:onYtReady, onStateChange:onYtState, onError:onYtError }
-      });
-    } else if (YT_PLAYLIST_ID) {
-      ytPlayer = new YT.Player('yt-sound', {
-        width:200, height:200, playerVars:{ ...playerVars, listType:'playlist', list:YT_PLAYLIST_ID },
-        events:{ onReady:onYtReady, onStateChange:onYtState, onError:onYtError }
-      });
+  const $play=document.getElementById('yt-play'), $prev=document.getElementById('yt-prev'), $next=document.getElementById('yt-next'), $mute=document.getElementById('yt-mute'), $vol=document.getElementById('yt-volume'), $label=document.getElementById('yt-label');
+  let ytPlayer=null; let wd=null; const WD_MS=10000;
+  function armWD(){ clearTimeout(wd); wd=setTimeout(()=>{ try{ if(ytPlayer.getPlayerState()!==YT.PlayerState.PLAYING){ ytPlayer.playVideo(); } }catch{} }, WD_MS); }
+  function disWD(){ clearTimeout(wd); wd=null; }
+  function restartFromBeginning(){ try{ if (YT_PLAYLIST_ID && typeof ytPlayer.playVideoAt==='function'){ ytPlayer.playVideoAt(0); } else { ytPlayer.seekTo(0,true); ytPlayer.playVideo(); } }catch(e){ console.warn('YT restart failed:', e); } }
+  window.onYouTubeIframeAPIReady = function(){
+    const baseVars={ autoplay:1, controls:0, disablekb:1, modestbranding:1, rel:0, fs:0, playsinline:1, loop:1, origin:location.origin };
+    if (YT_VIDEO_ID && !YT_PLAYLIST_ID){
+      const playerVars={ ...baseVars, playlist: YT_VIDEO_ID }; // required for single-video loop
+      ytPlayer=new YT.Player('yt-sound',{ width:200,height:200, videoId:YT_VIDEO_ID, playerVars, events:{ onReady:onReady, onStateChange:onState, onError:onErr } });
+    } else if (YT_PLAYLIST_ID){
+      const playerVars={ ...baseVars, listType:'playlist', list:YT_PLAYLIST_ID };
+      ytPlayer=new YT.Player('yt-sound',{ width:200,height:200, playerVars, events:{ onReady:onReady, onStateChange:onState, onError:onErr } });
     }
-  }
-  window.onYouTubeIframeAPIReady = onYouTubeIframeAPIReady;
-
-  function onYtReady() {
-    try {
-      ytPlayer.setVolume(Math.max(0, Math.min(100, Number(YT_VOLUME) || 60)));
-      $vol.value = ytPlayer.getVolume();
-      setMuteUI(ytPlayer.isMuted());
-      updateLabel(true);
-      startLabelPoll();
-
-      ytPlayer.unMute();
-      ytPlayer.playVideo();
-
-      // Arm watchdog to ensure we reach PLAYING
-      armPlayWatchdog();
-
-      // Fallback: try muted then unmute (handles autoplay policies)
-      let tries = 0;
-      const attemptUnmute = () => { try { ytPlayer.unMute(); setMuteUI(false); } catch {} if (++tries < 5) setTimeout(attemptUnmute, 3000); };
-      setTimeout(() => {
-        const state = ytPlayer.getPlayerState();
-        if (state !== YT.PlayerState.PLAYING) {
-          ytPlayer.mute(); setMuteUI(true);
-          ytPlayer.playVideo();
-          setTimeout(attemptUnmute, 2000);
-        }
-      }, 800);
-    } catch(e) { console.warn('YouTube init error:', e); }
-  }
-
-  function onYtState(e) {
-    const st = e.data;
-    const playing = st === YT.PlayerState.PLAYING;
-    setPlayingUI(playing);
-
-    if (st === YT.PlayerState.PLAYING) {
-      // Playing: cancel watchdog
-      disarmPlayWatchdog();
-      updateLabel(); startLabelPoll();
-    } else if (st === YT.PlayerState.BUFFERING || st === YT.PlayerState.UNSTARTED) {
-      // Buffering/unstarted: (re)arm watchdog
-      armPlayWatchdog();
-      updateLabel(); startLabelPoll();
-    } else if (st === YT.PlayerState.ENDED) {
-      // Let YT loop/advance; re-arm watchdog just in case
-      armPlayWatchdog();
-    } else if (st === YT.PlayerState.PAUSED || st === YT.PlayerState.CUED) {
-      if (st === YT.PlayerState.PAUSED) {
-        disarmPlayWatchdog();
-      } else {
-        armPlayWatchdog();
-      }
-    }
-  }
-
-  function onYtError(e) {
-    console.error('YouTube player error', e);
-    try {
-      ytPlayer.nextVideo();      // immediately skip problematic track
-      armPlayWatchdog();         // ensure the next one reaches PLAYING
-    } catch(err) {
-      console.warn('Failed to advance on error:', err);
-    }
-  }
-
-  $play.addEventListener('click', () => {
-    try { const st = ytPlayer.getPlayerState(); if (st === YT.PlayerState.PLAYING) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); } catch {}
-  });
-  $prev.addEventListener('click', () => { try { ytPlayer.previousVideo(); armPlayWatchdog(); } catch {} });
-  $next.addEventListener('click', () => { try { ytPlayer.nextVideo(); armPlayWatchdog(); } catch {} });
-  $mute.addEventListener('click', () => { try { if (ytPlayer.isMuted()) { ytPlayer.unMute(); setMuteUI(false); } else { ytPlayer.mute(); setMuteUI(true); } } catch {} });
-  $vol.addEventListener('input', () => { try { ytPlayer.setVolume(Number($vol.value)); } catch {} });
-
-  document.addEventListener('keydown', (ev) => {
-    if (ev.code === 'Space') { ev.preventDefault(); $play.click(); }
-    else if (ev.key.toLowerCase() === 'm') { $mute.click(); }
-    else if (ev.shiftKey && ev.code === 'ArrowLeft') { $prev.click(); }
-    else if (ev.shiftKey && ev.code === 'ArrowRight') { $next.click(); }
-  });
-
-  // Auto-hide controls after inactivity
-  let idleT = null;
-  function bumpActivity() {
-    document.body.classList.remove('idle');
-    if (idleT) clearTimeout(idleT);
-    idleT = setTimeout(() => document.body.classList.add('idle'), 3000);
-  }
-  ['mousemove','mousedown','keydown','touchstart'].forEach(ev =>
-    document.addEventListener(ev, bumpActivity, {passive:true})
-  );
-  bumpActivity();
-</script>
-
-<!-- Fullscreen toggle logic with SVG icon swap -->
-<script>
-  function isFullscreen(){ return !!document.fullscreenElement; }
-  async function enterFullscreen(){ try{ await document.documentElement.requestFullscreen({navigationUI:'hide'}); }catch(e){ console.warn('requestFullscreen failed:', e); } }
-  async function exitFullscreen(){ try{ await document.exitFullscreen(); }catch(e){ console.warn('exitFullscreen failed:', e); } }
-
-  const fsBtn     = document.getElementById('fs-toggle');
-  const enterIcon = document.getElementById('fs-icon-enter');
-  const exitIcon  = document.getElementById('fs-icon-exit');
-
-  function updateFsUI(){
-    const on = isFullscreen();
-    if (fsBtn){
-      fsBtn.title = on ? 'Minimize (exit fullscreen)' : 'Fullscreen';
-    }
-    if (enterIcon && exitIcon){
-      enterIcon.style.display = on ? 'none' : '';
-      exitIcon.style.display  = on ? '' : 'none';
-    }
-  }
-
-  if (!fsBtn) {
-    console.warn('fs-toggle button not found in DOM');
-  } else {
-    fsBtn.addEventListener('click', async () => {
-      try {
-        if (isFullscreen()) await exitFullscreen();
-        else await enterFullscreen();
-      } catch (e) {
-        console.warn('Fullscreen toggle failed:', e);
-      } finally {
-        updateFsUI();
-      }
-    });
-    document.addEventListener('fullscreenchange', updateFsUI);
-    updateFsUI();
-  }
-
-  // Keyboard shortcut: F toggles fullscreen
-  document.addEventListener('keydown', (e) => {
-    if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      e.preventDefault();
-      fsBtn?.click();
-    }
-  });
+  };
+  function onReady(){ try{ ytPlayer.setVolume(Math.max(0,Math.min(100, Number(YT_VOLUME)||60))); ytPlayer.unMute(); ytPlayer.playVideo(); armWD(); $vol.value=ytPlayer.getVolume(); }catch{} }
+  function onState(e){ const st=e.data; if(st===YT.PlayerState.PLAYING){ disWD(); armWD(); } else if(st===YT.PlayerState.ENDED){ restartFromBeginning(); armWD(); } else if(st===YT.PlayerState.BUFFERING||st===YT.PlayerState.UNSTARTED||st===YT.PlayerState.CUED){ armWD(); } }
+  function onErr(){ try{ if (YT_PLAYLIST_ID) ytPlayer.nextVideo(); else restartFromBeginning(); }catch{} armWD(); }
+  $play.addEventListener('click',()=>{ try{ const st=ytPlayer.getPlayerState(); if(st===YT.PlayerState.PLAYING) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); }catch{} });
+  $prev.addEventListener('click',()=>{ try{ ytPlayer.previousVideo(); armWD(); }catch{} });
+  $next.addEventListener('click',()=>{ try{ ytPlayer.nextVideo(); armWD(); }catch{} });
+  $mute.addEventListener('click',()=>{ try{ if(ytPlayer.isMuted()) ytPlayer.unMute(); else ytPlayer.mute(); }catch{} });
+  $vol.addEventListener('input',()=>{ try{ ytPlayer.setVolume(Number($vol.value)); }catch{} });
 </script>
 """
 
@@ -738,8 +518,24 @@ pre{background:#222;padding:1rem;border-radius:8px;overflow:auto}
 img,video{max-width:100%;height:auto;background:#000}
 a.link{color:#7fc7ff}
 </style>
-<h1>Diagnostics: first {{ count }} items (proxied)</h1>
-{% for it in items %}
+<h1>Diagnostics (local first {{ lcount }}, then proxied first {{ rcount }})</h1>
+<h2>Local cache</h2>
+{% for it in local_items %}
+  <div class="item">
+    <div><strong>{{ loop.index }}.</strong> {{ it.filename or '(no filename)' }} — {{ it.kind }}</div>
+    <div>Local path: <code>{{ it.path }}</code></div>
+    <div style="margin-top:.5rem">
+      {% if it.kind == 'video' %}
+        <video src="{{ url_for('local', index=loop.index0) }}" controls muted playsinline></video>
+      {% else %}
+        <img src="{{ url_for('local', index=loop.index0) }}" alt="{{ it.filename or '' }}" />
+      {% endif %}
+    </div>
+  </div>
+{% endfor %}
+
+<h2>Proxied (remote)</h2>
+{% for it in remote_items[:5] %}
   <div class="item">
     <div><strong>{{ loop.index }}.</strong> {{ it.filename or '(no filename)' }} — {{ it.mimeType }}</div>
     <div>Proxied image URL:
@@ -761,9 +557,9 @@ a.link{color:#7fc7ff}
     </div>
   </div>
 {% endfor %}
-<pre>{{ items|tojson(indent=2) }}</pre>
+<pre>Local index: {{ local_items|tojson(indent=2) }}</pre>
+<pre>Remote items: {{ remote_items[:5]|tojson(indent=2) }}</pre>
 """
-
 
 # -------------------------- routes --------------------------
 @app.route("/")
@@ -833,9 +629,7 @@ def auth_callback():
         flash("Authorization failed: no access token returned.")
         return redirect(url_for("pick"))
 
-    # Persist tokens for server-side kiosk use
     save_tokens(tok)
-
     return redirect(url_for("create_session"))
 
 # ---- Picker session lifecycle ----
@@ -847,7 +641,6 @@ def create_session():
         return redirect(url_for("auth_start"))
 
     try:
-        # Ensure a fresh session if none exists or near expiry
         data = _ensure_session(picking_config={})
     except requests.HTTPError as e:
         app.logger.error("Create/renew session failed: %s", e)
@@ -878,7 +671,7 @@ def status():
     picker_uri = session.get("picker_uri")
     if picker_uri:
         picker_uri = picker_uri.rstrip("/") + "/autoclose"
-    return render_template_string(STATUS_TEMPLATE, picker_uri=picker_uri, session_id=session.get("picker_session_id"))
+    return render_template_string(STATUS_TEMPLATE, picker_uri=picker_uri, session_id=session.get("picker_session_id"), cache_dir=CACHE_DIR)
 
 @app.route("/api/poll")
 def api_poll():
@@ -890,7 +683,6 @@ def api_poll():
     status_url = f"{PICKER_BASE}/sessions/{session_id}"
     renewed = False
     try:
-        # Renew if expired or expiring soon (buffer=30s during active polling)
         if _is_expired_or_close(session.get("picker_expire_time"), buffer_seconds=30):
             data = _ensure_session()
             session_id = session.get("picker_session_id")
@@ -900,7 +692,6 @@ def api_poll():
         r = picker_get(status_url)
         info = r.json()
 
-        # Update local expire_time if provided
         if info.get("expireTime"):
             session["picker_expire_time"] = info.get("expireTime")
 
@@ -943,7 +734,6 @@ def fetch_selected():
         while True:
             params = {"sessionId": session_id, "pageSize": 100}
             if page_token: params["pageToken"] = page_token
-            # Use picker_get with explicit URL + query params
             url = items_url + "?" + urlencode(params)
             r = picker_get(url)
             data = r.json()
@@ -974,14 +764,93 @@ def fetch_selected():
         app.logger.exception("Failed to save selected_media.json")
         flash("Failed to save selection locally (permission?)."); return redirect(url_for("screensaver"))
 
-    # --- Proactive cleanup: delete session (recommended to stay within limits) ---
+    # --- Download to local cache ---
+    ensure_cache_dir()
+    local_index = []
+
+    def ext_for_mime(m: str, kind: str) -> str:
+        m = (m or "").lower()
+        if kind == 'video':
+            if 'mp4' in m: return 'mp4'
+            if 'webm' in m: return 'webm'
+            return 'mp4'
+        if 'jpeg' in m or 'jpg' in m: return 'jpg'
+        if 'png' in m: return 'png'
+        if 'gif' in m: return 'gif'
+        if 'webp' in m: return 'webp'
+        if 'heic' in m or 'heif' in m: return 'heic'
+        return 'jpg'
+
+    def is_video_mime(m: str) -> bool:
+        m = (m or "").lower()
+        return m.startswith('video/') or ('motion' in m)
+
+    def auth_fetch(url: str) -> requests.Response:
+        at = get_client_access_token()
+        headers = {"Authorization": f"Bearer {at}"}
+        r = requests.get(url, headers=headers, timeout=60, stream=True)
+        if r.status_code in (401,403):
+            new_at = refresh_access_token(session.get("refresh_token"))
+            if new_at:
+                session["access_token"] = new_at
+                headers = {"Authorization": f"Bearer {new_at}"}
+                r = requests.get(url, headers=headers, timeout=60, stream=True)
+        return r
+
+    downloaded = 0
+    for i, item in enumerate(simplified):
+        base = item['baseUrl']
+        mime = (item['mimeType'] or '').lower()
+        fname = (item.get('filename') or f"item_{i}").strip().replace('/', '_')
+        kind = 'video' if is_video_mime(mime) else 'image'
+        try:
+            if kind == 'video':
+                url = base + "=dv"
+                r = auth_fetch(url)
+                if r.status_code != 200:
+                    app.logger.error("Video download failed %s: %s", r.status_code, url)
+                    continue
+                ctype = (r.headers.get('Content-Type','') or '').lower()
+                ext = ext_for_mime(ctype, 'video')
+                local_path = os.path.join(CACHE_DIR, f"{i}_{fname}.{ext}")
+                with open(local_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024*64):
+                        if chunk: f.write(chunk)
+                local_index.append({"path": local_path, "kind": "video", "filename": item.get('filename')})
+                downloaded += 1
+            else:
+                url = build_media_url(item, 'image', w=DL_WIDTH, h=DL_HEIGHT)
+                r = auth_fetch(url)
+                if r.status_code != 200:
+                    app.logger.error("Image download failed %s: %s", r.status_code, url)
+                    continue
+                ctype = (r.headers.get('Content-Type','application/octet-stream') or '').lower()
+                data = r.content
+                if ('heic' in ctype or 'heif' in ctype) and HEIF_ENABLED and Image is not None:
+                    try:
+                        img = Image.open(io.BytesIO(data))
+                        buf = io.BytesIO()
+                        img.convert("RGB").save(buf, format="JPEG", quality=90)
+                        data = buf.getvalue()
+                        ext = 'jpg'
+                    except Exception:
+                        app.logger.exception("HEIC→JPEG conversion failed; saving raw")
+                        ext = ext_for_mime(ctype, 'image')
+                else:
+                    ext = ext_for_mime(ctype, 'image')
+                local_path = os.path.join(CACHE_DIR, f"{i}_{fname}.{ext}")
+                with open(local_path, 'wb') as f:
+                    f.write(data)
+                local_index.append({"path": local_path, "kind": "image", "filename": item.get('filename')})
+                downloaded += 1
+        except Exception:
+            app.logger.exception("Download error for item %d", i)
+
+    write_cache_index(local_index)
+
+    # --- Cleanup: delete session ---
     try:
         del_url = f"{PICKER_BASE}/sessions/{session_id}"
-        try:
-            r = picker_get(del_url)  # will 405; use requests.delete with retry logic below
-        except Exception:
-            pass
-        # do delete with 401/403 retry
         at = get_client_access_token()
         headers = {"Authorization": f"Bearer {at}"}
         dr = requests.delete(del_url, headers=headers, timeout=20)
@@ -1001,17 +870,17 @@ def fetch_selected():
     session.pop("picker_uri", None)
     session.pop("picker_expire_time", None)
 
-    flash(f"Fetched {len(simplified)} selected items.")
+    flash(f"Downloaded {downloaded} items to local cache.")
     return redirect(url_for("screensaver"))
 
-# ---- Media proxy (fixes 403 in kiosk browser) ----
+# ---- Media proxy (fixes 403 in kiosk browser) + HEIC→JPEG conversion ----
 @app.route("/content/<int:index>")
 def content(index: int):
     items = load_media_items()
     if index < 0 or index >= len(items):
         abort(404)
     item = items[index]
-    kind = request.args.get("kind", "image")  # 'image' or 'video'
+    kind = request.args.get("kind", "image")
     try:
         w = int(request.args.get("w", "800"))
         h = int(request.args.get("h", "480"))
@@ -1022,14 +891,10 @@ def content(index: int):
     if not url:
         abort(404)
 
-    # Prefer session token (remote browsers that did OAuth)
     access_token = get_client_access_token()
-
-    # If no session token AND the request is local kiosk, use server-side token
     is_local = request.remote_addr in ("127.0.0.1", "::1")
     if (not access_token) and is_local and DISABLE_SESSION_AUTH_FOR_LOCAL:
         access_token = get_server_access_token()
-
     if not access_token:
         abort(401)
 
@@ -1037,7 +902,6 @@ def content(index: int):
         headers = {"Authorization": f"Bearer {at}"}
         r = requests.get(url, headers=headers, timeout=30)
         if r.status_code in (401, 403):
-            # Try refresh (client or server)
             new_at = None
             if is_local and DISABLE_SESSION_AUTH_FOR_LOCAL:
                 t = load_tokens()
@@ -1056,24 +920,80 @@ def content(index: int):
         if r.status_code != 200:
             app.logger.error("Proxy fetch failed (%s): %s", r.status_code, url)
             abort(r.status_code)
-        ctype = r.headers.get("Content-Type", "application/octet-stream")
-        resp = Response(r.content, status=200, mimetype=ctype)
+
+        ctype = r.headers.get("Content-Type", "application/octet-stream").lower()
+        data = r.content
+
+        if kind == "image" and ("heic" in ctype or "heif" in ctype):
+            if HEIF_ENABLED and Image is not None:
+                try:
+                    img = Image.open(io.BytesIO(data))
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=90)
+                    buf.seek(0)
+                    resp = Response(buf.getvalue(), status=200, mimetype="image/jpeg")
+                    resp.headers["Cache-Control"] = "private, max-age=1800"
+                    return resp
+                except Exception:
+                    app.logger.exception("HEIC→JPEG conversion failed; falling back to raw bytes")
+            else:
+                app.logger.warning("HEIC content but HEIF decoding not available; returning raw bytes")
+
+        resp = Response(data, status=200, mimetype=r.headers.get("Content-Type", "application/octet-stream"))
         resp.headers["Cache-Control"] = "private, max-age=1800"
         return resp
     except Exception:
         app.logger.exception("Proxy fetch exception for %s", url)
         abort(502)
 
+# ---- Serve local cached files ----
+@app.route("/local/<int:index>")
+def local(index: int):
+    items = read_cache_index()
+    if index < 0 or index >= len(items):
+        abort(404)
+    path = items[index].get('path')
+    if not path or not os.path.exists(path):
+        abort(404)
+    ext = os.path.splitext(path)[1].lower()
+    mime = 'application/octet-stream'
+    if ext in ('.jpg','.jpeg'): mime='image/jpeg'
+    elif ext == '.png': mime='image/png'
+    elif ext == '.gif': mime='image/gif'
+    elif ext == '.webp': mime='image/webp'
+    elif ext == '.mp4': mime='video/mp4'
+    elif ext == '.webm': mime='video/webm'
+    return send_file(path, mimetype=mime, conditional=True)
+
+@app.route("/cache/clear")
+def cache_clear():
+    try:
+        if os.path.exists(CACHE_DIR): shutil.rmtree(CACHE_DIR)
+        ensure_cache_dir(); write_cache_index([])
+        flash("Local cache cleared.")
+    except Exception:
+        app.logger.exception("Failed to clear cache"); flash("Failed to clear cache.")
+    return redirect(url_for("diag"))
+
 @app.route("/screensaver")
 def screensaver():
-    items = load_media_items()
+    local_items = read_cache_index()
+    remote_items = load_media_items()
+    use_local = len(local_items) > 0
     try: interval_seconds = int(request.args.get("interval", ADVANCE_SECONDS_DEFAULT))
     except ValueError: interval_seconds = ADVANCE_SECONDS_DEFAULT
     try: refresh_minutes = int(request.args.get("refresh", REFRESH_MINUTES_DEFAULT))
     except ValueError: refresh_minutes = REFRESH_MINUTES_DEFAULT
+
+    if use_local:
+        # No need to reload for baseUrl renewal
+        refresh_minutes = 0
+
     return render_template_string(
         SCREENSAVER_TEMPLATE,
-        items=items,
+        use_local=use_local,
+        local_items=local_items,
+        remote_items=remote_items,
         interval_seconds=interval_seconds,
         refresh_minutes=refresh_minutes,
         yt_video_id=YT_VIDEO_ID,
@@ -1084,13 +1004,20 @@ def screensaver():
 
 @app.route("/diag")
 def diag():
-    items = load_media_items()
-    count = min(5, len(items))
-    return render_template_string(DIAG_TEMPLATE, items=items[:count], count=count)
+    local_items = read_cache_index()
+    remote_items = load_media_items()
+    return render_template_string(
+        DIAG_TEMPLATE,
+        local_items=local_items,
+        lcount=len(local_items),
+        remote_items=remote_items,
+        rcount=min(5, len(remote_items)),
+    )
 
 @app.route("/auth/signout")
 def auth_signout():
     session.clear(); flash("Signed out."); return redirect(url_for("pick"))
 
 if __name__ == "__main__":
+    ensure_cache_dir()
     app.run(host="0.0.0.0", port=5000, debug=False)
