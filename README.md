@@ -316,5 +316,3 @@ journalctl -u kiosk-restart@<user>.service -f
     See `man systemd.time` for syntax.
 *   **Remove `sudo`** in `restart_kiosk.sh`: If your kiosk service is a **user unit only** (`systemctl --user`), you can drop the system-wide restart path and `sudo`.
 *   **Wayland / different display**: If you’re on Wayland or a different display, adjust `Environment=DISPLAY` and how you launch the browser in `kiosk.service`.
-
-If you want, I can tailor the timer to **restart the Flask app** (`gphotos-screensaver@<user>.service`) before the browser, or add a **log rotation** step to keep Chromium profile/cache small.
