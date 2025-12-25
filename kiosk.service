@@ -1,16 +1,23 @@
+
 [Unit]
 Description=Chromium Kiosk (PipeWire + Bluetooth)
-After=pipewire.service wireplumber.service pipewire-pulse.service bluetooth.target
-Requires=pipewire.service wireplumber.service pipewire-pulse.service
+After=graphical.target pipewire.service wireplumber.service pipewire-pulse.service bluetooth.target gphotos-screensaver@%i.service
+Requires=pipewire.service wireplumber.service pipewire-pulse.service gphotos-screensaver@%i.service
 
 [Service]
 Type=simple
 
+# Run under the intended user
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/google-photos-screensaver
+
 # Ensure we run on the primary X display
 Environment=DISPLAY=:0
-Environment=HOME=/home/rgeorgiev
+Environment=HOME=/home/%i
 
 # Force Chromium (Pulse client via pipewire-pulse) to route to BT sink
+# NOTE: Replace the sink with your current device ID when it changes
 Environment=PULSE_SINK=bluez_output.88_57_1D_F0_60_80.1
 
 # --- PRE-START: Ensure audio path is ready ---
@@ -22,7 +29,7 @@ ExecStartPre=/bin/sh -lc 'sleep 2'
 ExecStartPre=/bin/sh -lc 'bluetoothctl connect 88:57:1D:F0:60:80 || true'
 
 # Force A2DP playback profile on the bluez card (if present)
-ExecStartPre=/bin/sh -lc 'CARD=$(pactl list cards short | awk "/bluez_card/ {print \$1}" | head -n1); [ -n "$CARD" ] && pactl set-card-profile "$CARD" a2dp-sink || true'
+ExecStartPre=/bin/sh -lc 'CARD=$(pactl list cards short | awk "/bluez_card/ {print \\$1}" | head -n1); [ -n "$CARD" ] && pactl set-card-profile "$CARD" a2dp-sink || true'
 
 # Set default sink to BT; if missing, fall back to HDMI
 ExecStartPre=/bin/sh -lc 'if wpctl status | awk "/bluez_output/ {found=1} END {exit !found}"; then wpctl set-default bluez_output.88_57_1D_F0_60_80.1 || true; else wpctl set-default alsa_output.platform-3f902000.hdmi.hdmi-stereo || true; fi'
@@ -57,5 +64,10 @@ RestartSec=3
 KillMode=process
 TimeoutStopSec=5
 
+# Hardening (optional)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
 [Install]
-WantedBy=default.target
+WantedBy=graphical.target
