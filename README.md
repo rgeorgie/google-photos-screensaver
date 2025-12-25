@@ -4,7 +4,6 @@ Flask app that uses the Google Photos Picker API (no PublicAlbum) to let a user 
 As of March/April 2025, Google removed/blocked shared-album methods in the old Library API and restricted listing/searching to app-created content. The supported way to get items from a user’s library (including shared/public albums via user selection) is the Picker API: create a session → open pickerUri → poll for completion → list selected items via photospicker.googleapis.com.
 
 ```
-tree google-photos-screensaver/
 google-photos-screensaver/
 ├── app.py
 ├── gphotos-screensaver.service
@@ -12,12 +11,12 @@ google-photos-screensaver/
 ├── kiosk.sh
 ├── requirements.txt
 ├── selected_media.json
-├── templates
-│   ├── pick.html
-│   └── screensaver.html
 └── tokens.json
 ```
-tested on Raspbian
+tested on RPi3 + Raspbian
+```
+Linux raspberrypi 6.12.47+rpt-rpi-v8 #1 SMP PREEMPT Debian 1:6.12.47-1+rpt1 (2025-09-16) aarch64 GNU/Linux
+```
 
 INSTALLATION:
 ```
