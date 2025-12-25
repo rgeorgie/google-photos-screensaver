@@ -80,21 +80,71 @@ WantedBy=multi-user.target
 ## 2) `kiosk.service`
 
 ```ini
+
 [Unit]
-Description=Chromium Kiosk for Google Photos Screensaver
-After=graphical.target gphotos-screensaver@%i.service
-Requires=gphotos-screensaver@%i.service
+Description=Chromium Kiosk (PipeWire + Bluetooth)
+After=graphical.target pipewire.service wireplumber.service pipewire-pulse.service bluetooth.target gphotos-screensaver@%i.service
+Requires=pipewire.service wireplumber.service pipewire-pulse.service gphotos-screensaver@%i.service
 
 [Service]
 Type=simple
+
+# Run under the intended user
 User=%i
 Group=%i
 WorkingDirectory=/home/%i/google-photos-screensaver
+
+# Ensure we run on the primary X display
 Environment=DISPLAY=:0
-Environment=XAUTHORITY=/home/%i/.Xauthority
-ExecStart=/home/%i/google-photos-screensaver/kiosk.sh
-Restart=always
+Environment=HOME=/home/%i
+
+# Force Chromium (Pulse client via pipewire-pulse) to route to BT sink
+# NOTE: Replace the sink with your current device ID when it changes
+Environment=PULSE_SINK=bluez_output.88_57_1D_F0_60_80.1
+
+# --- PRE-START: Ensure audio path is ready ---
+
+# Small delay so PipeWire/WirePlumber settle
+ExecStartPre=/bin/sh -lc 'sleep 2'
+
+# Connect to the soundbar (ignore errors if already connected)
+ExecStartPre=/bin/sh -lc 'bluetoothctl connect 88:57:1D:F0:60:80 || true'
+
+# Force A2DP playback profile on the bluez card (if present)
+ExecStartPre=/bin/sh -lc 'CARD=$(pactl list cards short | awk "/bluez_card/ {print \\$1}" | head -n1); [ -n "$CARD" ] && pactl set-card-profile "$CARD" a2dp-sink || true'
+
+# Set default sink to BT; if missing, fall back to HDMI
+ExecStartPre=/bin/sh -lc 'if wpctl status | awk "/bluez_output/ {found=1} END {exit !found}"; then wpctl set-default bluez_output.88_57_1D_F0_60_80.1 || true; else wpctl set-default alsa_output.platform-3f902000.hdmi.hdmi-stereo || true; fi'
+
+# Unmute and set volume high on the selected default sink
+ExecStartPre=/bin/sh -lc 'wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 || true'
+ExecStartPre=/bin/sh -lc 'wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.50 || true'
+
+# Kill any existing Chromium so our flags/environment take effect
+ExecStartPre=/bin/sh -lc 'pkill -x chromium || true'
+ExecStartPre=/bin/sh -lc 'pkill -x /usr/lib/chromium/chromium || true'
+
+# Optional: sanity test (comment out if you don’t want a tone at startup)
+# ExecStartPre=/bin/sh -lc 'pw-play /usr/share/sounds/alsa/Front_Center.wav || true'
+
+# --- START: Chromium kiosk ---
+ExecStart=/usr/lib/chromium/chromium \
+  --kiosk \
+  --ozone-platform=x11 \
+  --disable-gpu \
+  --autoplay-policy=no-user-gesture-required \
+  --disable-dev-shm-usage \
+  --no-default-browser-check \
+  --noerrdialogs \
+  http://127.0.0.1:5000/screensaver
+
+# Restart chromium if it crashes
+Restart=on-failure
 RestartSec=3
+
+# Make sure the service can be stopped cleanly
+KillMode=process
+TimeoutStopSec=5
 
 # Hardening (optional)
 NoNewPrivileges=true
@@ -103,6 +153,7 @@ ProtectHome=true
 
 [Install]
 WantedBy=graphical.target
+
 ```
 
 **Notes**
