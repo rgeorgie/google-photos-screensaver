@@ -1,13 +1,17 @@
-
 #!/usr/bin/env python3
 """
-Google Photos Screensaver (Flask + Picker API) — Raspberry Pi
+Google Photos Screensaver (Flask + Picker API) — Raspberry Pi (cleaned)
 
-Adds durable local storage so the slideshow runs 24/7 without re‑auth:
-- Downloads picked media to **/cache/photos/** (configurable via `CACHE_DIR`) and builds `cache_index.json`.
-- Screensaver prefers local cached files via `/local/<index>`; falls back to proxy `/content/<index>` if no cache yet.
-- HEIC/HEIF → JPEG conversion during download if `pillow-heif` is present.
-- YouTube music hardened: single‑video loop via `playlist=VIDEO_ID`, playlist restart on END, watchdog.
+What’s included:
+- OAuth + Google Photos Picker session (create, poll, list picked items).
+- One‑time **download** of picked media to local cache (**/cache/photos/** by default).
+- Screensaver plays **from local cache** 24/7; falls back to remote proxy when cache is empty.
+- HEIC/HEIF → JPEG conversion on download (if `pillow-heif` available).
+- YouTube music: single‑video loop enforced (`playlist=VIDEO_ID`), playlist restart on END, watchdog.
+
+Removed/trimmed:
+- Unused endpoints (`/api/picker/session`, compat poll), favicon and healthz.
+- Unused YT_HIDE_VIDEO parameter.
 """
 
 import os
@@ -55,18 +59,17 @@ SELECTION_STORE = os.getenv("SELECTION_STORE", "selected_media.json")
 ADVANCE_SECONDS_DEFAULT = int(os.getenv("ADVANCE_SECONDS", "10"))
 REFRESH_MINUTES_DEFAULT = int(os.getenv("REFRESH_MINUTES", "60"))  # baseUrl validity ~60 mins
 
-# --- YouTube music config (set via environment) ---
-YT_VIDEO_ID = os.getenv("YT_VIDEO_ID", "")           # e.g., "utbIKghScn8"
-YT_PLAYLIST_ID = os.getenv("YT_PLAYLIST_ID", "")     # e.g., "PLxxxxxxxx"
-YT_VOLUME = int(os.getenv("YT_VOLUME", "60"))        # 0..100
-YT_HIDE_VIDEO = os.getenv("YT_HIDE_VIDEO", "true").lower() == "true"
+# --- YouTube music config ---
+YT_VIDEO_ID = os.getenv("YT_VIDEO_ID", "")
+YT_PLAYLIST_ID = os.getenv("YT_PLAYLIST_ID", "")
+YT_VOLUME = int(os.getenv("YT_VOLUME", "60"))
 
 # --- Server-side token store (for kiosk localhost fetches) ---
 TOKENS_STORE = os.getenv("TOKENS_STORE", "tokens.json")
 DISABLE_SESSION_AUTH_FOR_LOCAL = os.getenv("DISABLE_SESSION_AUTH_FOR_LOCAL", "true").lower() == "true"
 
 # --- Auto-renew buffer for Picker sessions ---
-SESSION_RENEW_BUFFER_SEC = int(os.getenv("SESSION_RENEW_BUFFER_SEC", "60"))  # renew if expiring within next 60s
+SESSION_RENEW_BUFFER_SEC = int(os.getenv("SESSION_RENEW_BUFFER_SEC", "60"))
 
 # Force crop param to encourage JPEG derivatives
 FORCE_CROP_PARAM = os.getenv("FORCE_CROP_PARAM", "true").lower() == "true"
@@ -83,11 +86,7 @@ logging.basicConfig(level=logging.INFO)
 
 # -------------------------- utilities --------------------------
 def ensure_cache_dir():
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-    except Exception:
-        app.logger.exception("Failed to create CACHE_DIR %s", CACHE_DIR)
-        raise
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 def read_cache_index():
@@ -137,12 +136,12 @@ def build_media_url(item: dict, kind: str, w: int = 800, h: int = 480) -> str:
     if not base:
         return ""
     if kind == "video" or mt.startswith("video/") or "motion" in mt:
-        return base + "=dv"  # video stream via '=dv' (not compatible with w/h)
+        return base + "=dv"
     if FORCE_CROP_PARAM:
         return f"{base}=w{w}-h{h}-c"
     return f"{base}=w{w}-h{h}"
 
-# -------- token persistence & refresh (server-side) ----------
+# -------- token persistence & refresh ----------
 def _merge_tokens(new_tok: dict, old_tok: dict) -> dict:
     merged = dict(old_tok or {})
     for k in ("access_token", "refresh_token", "token_type", "expires_in"):
@@ -160,7 +159,7 @@ def save_tokens(tok: dict) -> None:
             with open(TOKENS_STORE, "r", encoding="utf-8") as f:
                 old = json.load(f)
         except Exception:
-            app.logger.exception("Failed to read existing tokens.json during save")
+            app.logger.exception("Failed to read tokens.json during save")
     data = _merge_tokens(tok, old)
     try:
         with open(TOKENS_STORE, "w", encoding="utf-8") as f:
@@ -171,8 +170,7 @@ def save_tokens(tok: dict) -> None:
 
 
 def load_tokens() -> dict:
-    if not os.path.exists(TOKENS_STORE):
-        return {}
+    if not os.path.exists(TOKENS_STORE): return {}
     try:
         with open(TOKENS_STORE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -270,14 +268,12 @@ def picker_post(url: str, payload: dict) -> requests.Response:
 
 # -------------------------- session auto-renew helpers --------------------------
 def _iso_to_epoch(iso_ts: str) -> float:
-    if not iso_ts:
-        return 0.0
+    if not iso_ts: return 0.0
     return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).timestamp()
 
 
 def _is_expired_or_close(expire_iso: str, buffer_seconds: int = SESSION_RENEW_BUFFER_SEC) -> bool:
-    if not expire_iso:
-        return True
+    if not expire_iso: return True
     now = time.time()
     exp = _iso_to_epoch(expire_iso)
     return exp <= (now + buffer_seconds)
@@ -288,8 +284,7 @@ def _ensure_session(picking_config: dict | None = None) -> dict:
     exp = session.get("picker_expire_time")
     if (not sid) or _is_expired_or_close(exp):
         url = f"{PICKER_BASE}/sessions"
-        payload = picking_config or {}
-        r = picker_post(url, payload)
+        r = picker_post(url, picking_config or {})
         data = r.json()
         session["picker_session_id"] = data.get("id")
         session["picker_uri"] = data.get("pickerUri")
@@ -321,7 +316,7 @@ a.button{display:inline-block;padding:.6rem 1rem;border:1px solid #08c;border-ra
 <div class="box">
   <p><strong>Step 1:</strong> <a class="button" href="{{ url_for('auth_start') }}">Authorize with Google</a></p>
   <p><strong>Step 2:</strong> <a class="button" href="{{ url_for('create_session') }}">Create Picker Session</a></p>
-  <p><strong>Step 3:</strong> <a class="button" href="{{ url_for('status') }}">Status (auto-polls)</a> → fetch → screensaver</p>
+  <p><strong>Step 3:</strong> <a class="button" href="{{ url_for('status') }}">Status (auto‑polls)</a> → fetch → screensaver</p>
   <p><strong>Step 4:</strong> <a class="button" href="{{ url_for('screensaver') }}">Launch screensaver</a></p>
   <p><strong>Diagnostics:</strong> <a class="button" href="{{ url_for('diag') }}">Open diagnostics</a></p>
 </div>
@@ -342,13 +337,13 @@ a.button{display:inline-block;padding:.6rem 1rem;border:1px solid #08c;border-ra
 <h1>Waiting for Google Photos selection…</h1>
 {% if picker_uri %}
   <p><a class="button" href="{{ picker_uri }}" target="_blank" rel="noopener">Open Google Photos Picker (new tab)</a>
-     <span class="muted"> (allow pop‑ups if blocked)</span></p>
+     <span class="muted">(allow pop‑ups if blocked)</span></p>
   <p><a class="button" href="{{ picker_uri }}">Open Picker in this tab</a></p>
 {% else %}
   <p><em>No picker URI found; please <a href="{{ url_for('create_session') }}">create a new session</a>.</em></p>
 {% endif %}
 {% if session_id %}<p>Session ID: <code>{{ session_id }}</code></p>{% endif %}
-<p class="muted">In Google Photos: search your album → open it → <strong>select photos/videos</strong> → press <strong>Done</strong>. Selected items will be downloaded to <code>{{ cache_dir }}</code>.</p>
+<p class="muted">Select photos/videos → press <strong>Done</strong>. The app will download your selection to <code>{{ cache_dir }}</code>.</p>
 {% with messages = get_flashed_messages() %}{% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}{% endwith %}
 <div id="debug"></div>
 <script>
@@ -480,7 +475,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const YT_VIDEO_ID    = {{ yt_video_id|tojson }};
   const YT_PLAYLIST_ID = {{ yt_playlist_id|tojson }};
   const YT_VOLUME      = {{ yt_volume|tojson }};
-  const $play=document.getElementById('yt-play'), $prev=document.getElementById('yt-prev'), $next=document.getElementById('yt-next'), $mute=document.getElementById('yt-mute'), $vol=document.getElementById('yt-volume'), $label=document.getElementById('yt-label');
+  const $play=document.getElementById('yt-play'), $prev=document.getElementById('yt-prev'), $next=document.getElementById('yt-next'), $mute=document.getElementById('yt-mute'), $vol=document.getElementById('yt-volume');
   let ytPlayer=null; let wd=null; const WD_MS=10000;
   function armWD(){ clearTimeout(wd); wd=setTimeout(()=>{ try{ if(ytPlayer.getPlayerState()!==YT.PlayerState.PLAYING){ ytPlayer.playVideo(); } }catch{} }, WD_MS); }
   function disWD(){ clearTimeout(wd); wd=null; }
@@ -518,7 +513,7 @@ pre{background:#222;padding:1rem;border-radius:8px;overflow:auto}
 img,video{max-width:100%;height:auto;background:#000}
 a.link{color:#7fc7ff}
 </style>
-<h1>Diagnostics (local first {{ lcount }}, then proxied first {{ rcount }})</h1>
+<h1>Diagnostics</h1>
 <h2>Local cache</h2>
 {% for it in local_items %}
   <div class="item">
@@ -566,14 +561,6 @@ a.link{color:#7fc7ff}
 def home():
     return redirect(url_for("pick"))
 
-@app.route("/healthz")
-def healthz():
-    return jsonify({"ok": True})
-
-@app.route("/favicon.ico")
-def favicon():
-    return ("", 204)
-
 @app.route("/pick")
 def pick():
     return render_template_string(PICK_TEMPLATE)
@@ -595,7 +582,6 @@ def auth_start():
 def auth_callback():
     code = request.args.get("code")
     if not code:
-        app.logger.error("OAuth callback: missing 'code'")
         flash("Authorization failed: missing code.")
         return redirect(url_for("pick"))
 
@@ -625,7 +611,6 @@ def auth_callback():
     session["token_saved_at"] = int(time.time())
 
     if not session["access_token"]:
-        app.logger.error("No access_token in token response: %s", tok)
         flash("Authorization failed: no access token returned.")
         return redirect(url_for("pick"))
 
@@ -639,32 +624,20 @@ def create_session():
     if not access_token:
         flash("Not authorized. Please start authorization.")
         return redirect(url_for("auth_start"))
-
     try:
         data = _ensure_session(picking_config={})
-    except requests.HTTPError as e:
-        app.logger.error("Create/renew session failed: %s", e)
-        flash("Failed to create Picker session. Is the Photos Picker API enabled & scope correct?")
-        return redirect(url_for("pick"))
     except Exception:
         app.logger.exception("Create session exception")
-        flash("Network error creating Picker session.")
+        flash("Failed to create Picker session.")
         return redirect(url_for("pick"))
-
     session_id = data.get("id")
     picker_uri = data.get("pickerUri")
     if not (session_id and picker_uri):
-        app.logger.error("Create session missing fields: %s", data)
         flash("Picker session created but missing data. Try again.")
         return redirect(url_for("pick"))
-
     session["picker_session_id"] = session_id
     session["picker_uri"] = picker_uri
     return redirect(url_for("status"))
-
-@app.route("/api/picker/session", methods=["POST"])
-def api_picker_session():
-    return create_session()
 
 @app.route("/status")
 def status():
@@ -679,55 +652,36 @@ def api_poll():
     session_id = session.get("picker_session_id")
     if not (access_token and session_id):
         return jsonify({"ready": False, "interval": 5.0, "error": "no_session"}), 200
-
     status_url = f"{PICKER_BASE}/sessions/{session_id}"
     renewed = False
     try:
         if _is_expired_or_close(session.get("picker_expire_time"), buffer_seconds=30):
-            data = _ensure_session()
+            _ensure_session()
             session_id = session.get("picker_session_id")
             status_url = f"{PICKER_BASE}/sessions/{session_id}"
             renewed = True
-
         r = picker_get(status_url)
         info = r.json()
-
         if info.get("expireTime"):
             session["picker_expire_time"] = info.get("expireTime")
-
         if info.get("mediaItemsSet"):
             return jsonify({"ready": True, "interval": 0, "renewed": renewed}), 200
         poll_cfg = info.get("pollingConfig", {})
         interval = parse_seconds(poll_cfg.get("pollInterval"), default=5.0)
         return jsonify({"ready": False, "interval": interval, "renewed": renewed}), 200
-    except requests.HTTPError as e:
-        app.logger.error("Poll status failed: %s", e)
-        return jsonify({"ready": False, "interval": 5.0, "error": "http_error"}), 200
     except Exception:
         app.logger.exception("Poll exception")
         return jsonify({"ready": False, "interval": 5.0, "error": "exception"}), 200
-
-@app.route("/poll-till-ready")
-def poll_till_ready_compat():
-    access_token = get_client_access_token()
-    session_id = session.get("picker_session_id")
-    if not (access_token and session_id): return redirect(url_for("create_session"))
-    status_url = f"{PICKER_BASE}/sessions/{session_id}"
-    try:
-        r = picker_get(status_url)
-        info = r.json()
-        if info.get("mediaItemsSet"): return redirect(url_for("fetch_selected"))
-        return ("", 204)
-    except Exception:
-        app.logger.exception("Compat poll exception"); return ("", 204)
 
 @app.route("/fetch-selected")
 def fetch_selected():
     access_token = get_client_access_token()
     session_id = session.get("picker_session_id")
     if not (access_token and session_id):
-        flash("No active Picker session. Create session first."); return redirect(url_for("create_session"))
+        flash("No active Picker session. Create session first.")
+        return redirect(url_for("create_session"))
 
+    # List picked items
     items_url = f"{PICKER_BASE}/mediaItems"
     all_items, page_token = [], None
     try:
@@ -742,9 +696,8 @@ def fetch_selected():
             if not page_token: break
     except Exception:
         app.logger.exception("Fetch selected exception")
-        flash("Network error fetching selected items."); return redirect(url_for("status"))
-
-    app.logger.info("Picked items count: %d", len(all_items))
+        flash("Network error fetching selected items.")
+        return redirect(url_for("status"))
 
     simplified = []
     for m in all_items:
@@ -756,15 +709,12 @@ def fetch_selected():
         simplified.append({"baseUrl": base, "mimeType": mime, "filename": filename})
 
     if len(simplified) == 0:
-        flash("No items selected. In Google Photos: search the album, open it, select photos/videos, then press Done.")
+        flash("No items selected. Pick in Google Photos and press Done.")
         return redirect(url_for("status"))
 
-    try: save_media_items(simplified)
-    except Exception:
-        app.logger.exception("Failed to save selected_media.json")
-        flash("Failed to save selection locally (permission?)."); return redirect(url_for("screensaver"))
+    save_media_items(simplified)
 
-    # --- Download to local cache ---
+    # Download to local cache
     ensure_cache_dir()
     local_index = []
 
@@ -848,7 +798,7 @@ def fetch_selected():
 
     write_cache_index(local_index)
 
-    # --- Cleanup: delete session ---
+    # Delete session (optional cleanup)
     try:
         del_url = f"{PICKER_BASE}/sessions/{session_id}"
         at = get_client_access_token()
@@ -860,12 +810,10 @@ def fetch_selected():
                 session["access_token"] = new_at
                 headers = {"Authorization": f"Bearer {new_at}"}
                 dr = requests.delete(del_url, headers=headers, timeout=20)
-        if dr.status_code not in (200, 204):
-            app.logger.warning("sessions.delete returned %s", dr.status_code)
     except Exception:
         app.logger.exception("Session delete failed")
 
-    # Clear session identifiers so next pick starts fresh
+    # Clear session identifiers
     session.pop("picker_session_id", None)
     session.pop("picker_uri", None)
     session.pop("picker_expire_time", None)
@@ -873,7 +821,7 @@ def fetch_selected():
     flash(f"Downloaded {downloaded} items to local cache.")
     return redirect(url_for("screensaver"))
 
-# ---- Media proxy (fixes 403 in kiosk browser) + HEIC→JPEG conversion ----
+# ---- Media proxy + HEIC→JPEG ----
 @app.route("/content/<int:index>")
 def content(index: int):
     items = load_media_items()
@@ -986,7 +934,6 @@ def screensaver():
     except ValueError: refresh_minutes = REFRESH_MINUTES_DEFAULT
 
     if use_local:
-        # No need to reload for baseUrl renewal
         refresh_minutes = 0
 
     return render_template_string(
@@ -999,7 +946,6 @@ def screensaver():
         yt_video_id=YT_VIDEO_ID,
         yt_playlist_id=YT_PLAYLIST_ID,
         yt_volume=YT_VOLUME,
-        yt_hide_video=YT_HIDE_VIDEO,
     )
 
 @app.route("/diag")
@@ -1009,9 +955,7 @@ def diag():
     return render_template_string(
         DIAG_TEMPLATE,
         local_items=local_items,
-        lcount=len(local_items),
         remote_items=remote_items,
-        rcount=min(5, len(remote_items)),
     )
 
 @app.route("/auth/signout")
