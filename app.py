@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Google Photos Screensaver (Flask + Picker API) — Raspberry Pi (cleaned)
+Google Photos Screensaver (Flask + Picker API) — Raspberry Pi (cleaned + YT panel fix)
 
-What’s included:
+Includes:
 - OAuth + Google Photos Picker session (create, poll, list picked items).
-- One‑time **download** of picked media to local cache (**/cache/photos/** by default).
-- Screensaver plays **from local cache** 24/7; falls back to remote proxy when cache is empty.
-- HEIC/HEIF → JPEG conversion on download (if `pillow-heif` available).
-- YouTube music: single‑video loop enforced (`playlist=VIDEO_ID`), playlist restart on END, watchdog.
+- One‑time download of picked media to local cache (**/cache/photos/** by default).
+- Screensaver plays from local cache 24/7; falls back to remote proxy when cache is empty.
+- HEIC/HEIF → JPEG conversion on download (if `pillow-heif` available) and on-the-fly in proxy.
+- YouTube music: single‑video loop enforced (`playlist=VIDEO_ID`), playlist restart on END,
+  watchdog, auto‑hide panel, title polling, working controls & shortcuts.
 
-Removed/trimmed:
-- Unused endpoints (`/api/picker/session`, compat poll), favicon and healthz.
-- Unused YT_HIDE_VIDEO parameter.
+Trimmed:
+- Removed unused endpoints (compat poll, extra session route), favicon/healthz.
 """
 
 import os
@@ -422,7 +422,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function viewWH(){ return { w: Math.max(1, Math.round(window.innerWidth || 800)), h: Math.max(1, Math.round(window.innerHeight || 480))}; }
 
-  function isVideoRemote(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startsWith('video/') || mt.includes('motion'); }
+  function isVideoRemote(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startswith('video/') || mt.includes('motion'); }
   function remoteUrlFor(it, kind){ const {w,h}=viewWH(); const idx=REMOTE_ITEMS.indexOf(it); const q=new URLSearchParams({kind,w:String(w),h:String(h)}); return '/content/'+idx+'?'+q.toString(); }
 
   let idx = 0;
@@ -470,34 +470,173 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 </script>
 
-<!-- YouTube music player (robust looping) -->
+<!-- YouTube music player (robust looping + auto-hide + title polling) -->
 <script>
   const YT_VIDEO_ID    = {{ yt_video_id|tojson }};
   const YT_PLAYLIST_ID = {{ yt_playlist_id|tojson }};
   const YT_VOLUME      = {{ yt_volume|tojson }};
-  const $play=document.getElementById('yt-play'), $prev=document.getElementById('yt-prev'), $next=document.getElementById('yt-next'), $mute=document.getElementById('yt-mute'), $vol=document.getElementById('yt-volume');
-  let ytPlayer=null; let wd=null; const WD_MS=10000;
-  function armWD(){ clearTimeout(wd); wd=setTimeout(()=>{ try{ if(ytPlayer.getPlayerState()!==YT.PlayerState.PLAYING){ ytPlayer.playVideo(); } }catch{} }, WD_MS); }
-  function disWD(){ clearTimeout(wd); wd=null; }
-  function restartFromBeginning(){ try{ if (YT_PLAYLIST_ID && typeof ytPlayer.playVideoAt==='function'){ ytPlayer.playVideoAt(0); } else { ytPlayer.seekTo(0,true); ytPlayer.playVideo(); } }catch(e){ console.warn('YT restart failed:', e); } }
+
+  const $controls = document.getElementById('yt-controls');
+  const $play     = document.getElementById('yt-play');
+  const $prev     = document.getElementById('yt-prev');
+  const $next     = document.getElementById('yt-next');
+  const $mute     = document.getElementById('yt-mute');
+  const $vol      = document.getElementById('yt-volume');
+  const $label    = document.getElementById('yt-label');
+
+  let ytPlayer = null;
+  let watchdogT = null;
+  const WATCHDOG_MS = 10000;
+
+  // Auto-hide controls after inactivity
+  let idleT = null;
+  function bumpActivity() {
+    try {
+      document.body.classList.remove('idle');
+      if (idleT) clearTimeout(idleT);
+      idleT = setTimeout(() => document.body.classList.add('idle'), 3000);
+    } catch {}
+  }
+  ['mousemove','mousedown','keydown','touchstart'].forEach(ev =>
+    document.addEventListener(ev, bumpActivity, {passive:true})
+  );
+  bumpActivity();
+
+  function armWatchdog() {
+    clearTimeout(watchdogT);
+    watchdogT = setTimeout(() => {
+      try {
+        const st = ytPlayer.getPlayerState();
+        if (st !== YT.PlayerState.PLAYING) {
+          console.warn('[YT] Watchdog: not playing -> playVideo()');
+          ytPlayer.playVideo();
+        }
+      } catch(e) { console.warn('[YT] Watchdog check failed:', e); }
+    }, WATCHDOG_MS);
+  }
+  function disarmWatchdog() { clearTimeout(watchdogT); watchdogT = null; }
+
+  // Title polling
+  let labelPollT = null;
+  function fallbackLabel() {
+    try {
+      if (YT_PLAYLIST_ID && typeof ytPlayer.getPlaylistIndex === 'function') {
+        const idx = ytPlayer.getPlaylistIndex();
+        return (idx != null && idx >= 0) ? `Track ${idx+1}` : 'Now playing…';
+      }
+      const url = ytPlayer.getVideoUrl();
+      const m = /[?&]v=([^&]+)/.exec(url);
+      return m ? `Video ${m[1]}` : 'Now playing…';
+    } catch { return 'Now playing…'; }
+  }
+  function updateLabel() {
+    try {
+      const d = ytPlayer.getVideoData();
+      const title = (d && d.title) ? d.title.trim() : '';
+      $label.textContent = title || fallbackLabel();
+    } catch { $label.textContent = fallbackLabel(); }
+  }
+  function startLabelPoll() {
+    clearInterval(labelPollT);
+    let ticks = 0;
+    labelPollT = setInterval(() => {
+      updateLabel();
+      if (++ticks >= 10) clearInterval(labelPollT);
+    }, 1500);
+  }
+
+  function restartFromBeginning() {
+    try {
+      if (YT_PLAYLIST_ID && typeof ytPlayer.playVideoAt === 'function') {
+        ytPlayer.playVideoAt(0);
+      } else {
+        ytPlayer.seekTo(0, true);
+        ytPlayer.playVideo();
+      }
+    } catch(e) { console.warn('[YT] restartFromBeginning failed:', e); }
+  }
+
+  function setPlayingUI(playing) { try { $play.textContent = playing ? '⏸' : '⏯'; } catch {} }
+  function setMuteUI(muted)      { try { $mute.textContent = muted ? '🔇' : '🔈'; } catch {} }
+
   window.onYouTubeIframeAPIReady = function(){
-    const baseVars={ autoplay:1, controls:0, disablekb:1, modestbranding:1, rel:0, fs:0, playsinline:1, loop:1, origin:location.origin };
-    if (YT_VIDEO_ID && !YT_PLAYLIST_ID){
-      const playerVars={ ...baseVars, playlist: YT_VIDEO_ID }; // required for single-video loop
-      ytPlayer=new YT.Player('yt-sound',{ width:200,height:200, videoId:YT_VIDEO_ID, playerVars, events:{ onReady:onReady, onStateChange:onState, onError:onErr } });
-    } else if (YT_PLAYLIST_ID){
-      const playerVars={ ...baseVars, listType:'playlist', list:YT_PLAYLIST_ID };
-      ytPlayer=new YT.Player('yt-sound',{ width:200,height:200, playerVars, events:{ onReady:onReady, onStateChange:onState, onError:onErr } });
+    if (!YT_VIDEO_ID && !YT_PLAYLIST_ID) {
+      console.error('[YT] No YT_VIDEO_ID nor YT_PLAYLIST_ID provided.');
+      return;
+    }
+    const baseVars = {
+      autoplay: 1, controls: 0, disablekb: 1,
+      modestbranding: 1, rel: 0, fs: 0, playsinline: 1, loop: 1,
+      origin: location.origin
+    };
+    if (YT_VIDEO_ID && !YT_PLAYLIST_ID) {
+      const playerVars = { ...baseVars, playlist: YT_VIDEO_ID };
+      ytPlayer = new YT.Player('yt-sound', {
+        width: 200, height: 200, videoId: YT_VIDEO_ID, playerVars,
+        events: { onReady: onReady, onStateChange: onState, onError: onErr }
+      });
+      console.log('[YT] Player init: single video', YT_VIDEO_ID);
+    } else if (YT_PLAYLIST_ID) {
+      const playerVars = { ...baseVars, listType: 'playlist', list: YT_PLAYLIST_ID };
+      ytPlayer = new YT.Player('yt-sound', {
+        width: 200, height: 200, playerVars,
+        events: { onReady: onReady, onStateChange: onState, onError: onErr }
+      });
+      console.log('[YT] Player init: playlist', YT_PLAYLIST_ID);
     }
   };
-  function onReady(){ try{ ytPlayer.setVolume(Math.max(0,Math.min(100, Number(YT_VOLUME)||60))); ytPlayer.unMute(); ytPlayer.playVideo(); armWD(); $vol.value=ytPlayer.getVolume(); }catch{} }
-  function onState(e){ const st=e.data; if(st===YT.PlayerState.PLAYING){ disWD(); armWD(); } else if(st===YT.PlayerState.ENDED){ restartFromBeginning(); armWD(); } else if(st===YT.PlayerState.BUFFERING||st===YT.PlayerState.UNSTARTED||st===YT.PlayerState.CUED){ armWD(); } }
-  function onErr(){ try{ if (YT_PLAYLIST_ID) ytPlayer.nextVideo(); else restartFromBeginning(); }catch{} armWD(); }
-  $play.addEventListener('click',()=>{ try{ const st=ytPlayer.getPlayerState(); if(st===YT.PlayerState.PLAYING) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); }catch{} });
-  $prev.addEventListener('click',()=>{ try{ ytPlayer.previousVideo(); armWD(); }catch{} });
-  $next.addEventListener('click',()=>{ try{ ytPlayer.nextVideo(); armWD(); }catch{} });
-  $mute.addEventListener('click',()=>{ try{ if(ytPlayer.isMuted()) ytPlayer.unMute(); else ytPlayer.mute(); }catch{} });
-  $vol.addEventListener('input',()=>{ try{ ytPlayer.setVolume(Number($vol.value)); }catch{} });
+
+  function onReady() {
+    try {
+      ytPlayer.setVolume(Math.max(0, Math.min(100, Number(YT_VOLUME) || 60)));
+      $vol.value = ytPlayer.getVolume();
+      ytPlayer.unMute();
+      setMuteUI(false);
+      ytPlayer.playVideo();
+      armWatchdog();
+      updateLabel(); startLabelPoll();
+      setPlayingUI(true);
+      bumpActivity();
+    } catch(e) { console.warn('[YT] onReady error:', e); }
+  }
+
+  function onState(e) {
+    const st = e.data;
+    const playing = st === YT.PlayerState.PLAYING;
+    setPlayingUI(playing);
+    if (st === YT.PlayerState.PLAYING) {
+      updateLabel(); startLabelPoll();
+      disarmWatchdog(); armWatchdog();
+    } else if (st === YT.PlayerState.ENDED) {
+      restartFromBeginning(); armWatchdog();
+    } else if (st === YT.PlayerState.BUFFERING || st === YT.PlayerState.UNSTARTED || st === YT.PlayerState.CUED) {
+      armWatchdog();
+    }
+  }
+  function onErr(e) {
+    console.error('[YT] player error', e);
+    try { if (YT_PLAYLIST_ID) ytPlayer.nextVideo(); else restartFromBeginning(); } catch {}
+    armWatchdog();
+  }
+
+  $play.addEventListener('click', () => {
+    try { const st = ytPlayer.getPlayerState(); if (st === YT.PlayerState.PLAYING) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); } catch {}
+    bumpActivity();
+  });
+  $prev.addEventListener('click', () => { try { ytPlayer.previousVideo(); } catch {} bumpActivity(); armWatchdog(); });
+  $next.addEventListener('click', () => { try { ytPlayer.nextVideo(); } catch {} bumpActivity(); armWatchdog(); });
+  $mute.addEventListener('click', () => {
+    try { if (ytPlayer.isMuted()) { ytPlayer.unMute(); setMuteUI(false); } else { ytPlayer.mute(); setMuteUI(true); } } catch {}
+    bumpActivity();
+  });
+  $vol.addEventListener('input', () => { try { ytPlayer.setVolume(Number($vol.value)); } catch {} bumpActivity(); });
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.code === 'Space') { ev.preventDefault(); $play.click(); }
+    else if (ev.key.toLowerCase() === 'm') { $mute.click(); }
+    else if (ev.shiftKey && ev.code === 'ArrowLeft') { $prev.click(); }
+    else if (ev.shiftKey && ev.code === 'ArrowRight') { $next.click(); }
+  });
 </script>
 """
 
@@ -681,7 +820,6 @@ def fetch_selected():
         flash("No active Picker session. Create session first.")
         return redirect(url_for("create_session"))
 
-    # List picked items
     items_url = f"{PICKER_BASE}/mediaItems"
     all_items, page_token = [], None
     try:
@@ -714,7 +852,6 @@ def fetch_selected():
 
     save_media_items(simplified)
 
-    # Download to local cache
     ensure_cache_dir()
     local_index = []
 
@@ -798,7 +935,7 @@ def fetch_selected():
 
     write_cache_index(local_index)
 
-    # Delete session (optional cleanup)
+    # Optional cleanup: delete session
     try:
         del_url = f"{PICKER_BASE}/sessions/{session_id}"
         at = get_client_access_token()
