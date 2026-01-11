@@ -12,6 +12,11 @@ Includes:
 
 Trimmed:
 - Removed unused endpoints (compat poll, extra session route), favicon/healthz.
+
+Fixes in this version:
+- Prevent stretched photos: object-fit: contain + object-position: center.
+- Default no forced crop on Google Photos image derivatives (FORCE_CROP_PARAM=false).
+- JS bugfix: startswith -> startsWith for video detection.
 """
 
 import os
@@ -72,7 +77,8 @@ DISABLE_SESSION_AUTH_FOR_LOCAL = os.getenv("DISABLE_SESSION_AUTH_FOR_LOCAL", "tr
 SESSION_RENEW_BUFFER_SEC = int(os.getenv("SESSION_RENEW_BUFFER_SEC", "60"))
 
 # Force crop param to encourage JPEG derivatives
-FORCE_CROP_PARAM = os.getenv("FORCE_CROP_PARAM", "true").lower() == "true"
+# DEFAULT CHANGED: make this false to avoid server-side forced cropping.
+FORCE_CROP_PARAM = os.getenv("FORCE_CROP_PARAM", "false").lower() == "true"
 
 # --- Local cache ---
 CACHE_DIR = os.getenv("CACHE_DIR", "/cache/photos/")
@@ -131,6 +137,14 @@ def parse_seconds(d, default=5.0):
 
 
 def build_media_url(item: dict, kind: str, w: int = 800, h: int = 480) -> str:
+    """
+    Construct a Google Photos baseUrl with proper parameters.
+
+    - For videos: '=dv' (transcoded bytes).
+    - For images:
+        * Without '-c': Google scales to fit within w×h while preserving aspect ratio.
+        * With '-c': Google crops to exactly w×h (fills & may crop).
+    """
     base = item.get("baseUrl") or ""
     mt = (item.get("mimeType") or "").lower()
     if not base:
@@ -139,6 +153,7 @@ def build_media_url(item: dict, kind: str, w: int = 800, h: int = 480) -> str:
         return base + "=dv"
     if FORCE_CROP_PARAM:
         return f"{base}=w{w}-h{h}-c"
+    # Default: no crop; let Google fit while preserving aspect ratio.
     return f"{base}=w{w}-h{h}"
 
 # -------- token persistence & refresh ----------
@@ -374,7 +389,14 @@ SCREENSAVER_TEMPLATE = """
 <style>
 html,body{height:100%;width:100%;margin:0;background:#000;overflow:hidden;cursor:none}
 .stage{position:fixed;inset:0;display:grid;place-items:center}
-img,video{width:100vw;height:100vh;object-fit:scale-down;background:#000}
+/* FIX: prevent stretching — keep aspect ratio */
+img,video{
+  width:100vw;
+  height:100vh;
+  object-fit:contain;        /* or 'cover' if you prefer full-bleed with cropping */
+  object-position:center;
+  background:#000;
+}
 .fade{animation:fade .6s ease}@keyframes fade{from{opacity:0}to{opacity:1}}
 .empty{color:#ccc;font-family:system-ui,sans-serif}
 #log{position:fixed;left:8px;bottom:8px;color:#888;font:12px ui-monospace,monospace;max-width:95vw;white-space:pre-wrap}
@@ -422,8 +444,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function viewWH(){ return { w: Math.max(1, Math.round(window.innerWidth || 800)), h: Math.max(1, Math.round(window.innerHeight || 480))}; }
 
-  function isVideoRemote(it){ const mt=(it.mimeType||'').toLowerCase(); return mt.startswith('video/') || mt.includes('motion'); }
-  function remoteUrlFor(it, kind){ const {w,h}=viewWH(); const idx=REMOTE_ITEMS.indexOf(it); const q=new URLSearchParams({kind,w:String(w),h:String(h)}); return '/content/'+idx+'?'+q.toString(); }
+  // FIX: JS startsWith (not startswith)
+  function isVideoRemote(it){
+    const mt=(it.mimeType||'').toLowerCase();
+    return mt.startsWith('video/') || mt.includes('motion');
+  }
+  function remoteUrlFor(it, kind){
+    const {w,h}=viewWH();
+    const idx=REMOTE_ITEMS.indexOf(it);
+    const q=new URLSearchParams({kind,w:String(w),h:String(h)});
+    return '/content/'+idx+'?'+q.toString();
+  }
 
   let idx = 0;
   async function showLocal(i){
@@ -444,7 +475,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function showRemote(i){
     const it = REMOTE_ITEMS[i]; if(!it) return;
     stage.innerHTML=''; let el, kind = isVideoRemote(it) ? 'video' : 'image'; const url = remoteUrlFor(it, kind);
-    const onError = async () => { const fb = remoteUrlFor(it,'image'); const img=document.createElement('img'); img.src=fb; img.alt=it.filename||''; img.addEventListener('error',()=>logMsg('Fallback image error: '+fb)); img.addEventListener('load',()=>logMsg('Fallback image loaded: '+(it.filename||''))); stage.innerHTML=''; stage.appendChild(img); };
+    const onError = async () => {
+      const fb = remoteUrlFor(it,'image');
+      const img=document.createElement('img'); img.src=fb; img.alt=it.filename||'';
+      img.addEventListener('error',()=>logMsg('Fallback image error: '+fb));
+      img.addEventListener('load',()=>logMsg('Fallback image loaded: '+(it.filename||'')));
+      stage.innerHTML=''; stage.appendChild(img);
+    };
     if (kind==='video'){
       el=document.createElement('video'); el.src=url; el.autoplay=true; el.loop=true; el.muted=true; el.playsInline=true;
       el.addEventListener('error', async ()=>{ logMsg('Video error: '+url); await onError(); });
